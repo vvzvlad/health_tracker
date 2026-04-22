@@ -77,6 +77,8 @@ class HealthBot:
 
     async def _cmd_start(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             await self.db.get_or_create_user(user_id, settings.default_timezone)
             logger.info("User {} started bot", user_id)
@@ -87,6 +89,8 @@ class HealthBot:
 
     async def _cmd_add(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             args = message.text.split()[1:]
             if not args:
@@ -116,6 +120,8 @@ class HealthBot:
 
     async def _cmd_list(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             metrics = await self.db.get_metrics(user_id)
             if not metrics:
@@ -134,6 +140,8 @@ class HealthBot:
 
     async def _cmd_delete(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             args = message.text.split()[1:]
             if not args:
@@ -151,6 +159,8 @@ class HealthBot:
 
     async def _cmd_track(self, message: Message, state: FSMContext) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             args = message.text.split()[1:]
             if not args:
@@ -186,6 +196,8 @@ class HealthBot:
 
     async def _fsm_value_input(self, message: Message, state: FSMContext) -> None:
         try:
+            if message.from_user is None:
+                return
             text = message.text.strip()
             if text in {"0", "1", "2", "3", "4", "5"}:
                 value = int(text)
@@ -204,6 +216,8 @@ class HealthBot:
 
     async def _cmd_export(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             args = message.text.split()[1:]
             metric_name = args[0] if args else None
@@ -224,7 +238,7 @@ class HealthBot:
                 dt_utc = datetime.fromtimestamp(ts, tz=dt_timezone.utc)
                 dt_local = dt_utc.astimezone(user_tz)
                 utc_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-                local_str = dt_local.strftime("%Y-%m-%dT%H:%M:%S") + tz_str
+                local_str = dt_local.isoformat(timespec='seconds')
                 writer.writerow([r["metric_name"], r["value"], utc_str, local_str])
 
             csv_bytes = buf.getvalue().encode("utf-8")
@@ -238,6 +252,8 @@ class HealthBot:
 
     async def _cmd_timezone(self, message: Message) -> None:
         try:
+            if message.from_user is None:
+                return
             user_id = message.from_user.id
             args = message.text.split()[1:]
             if not args or not re.match(r'^[+-]\d{2}:\d{2}$', args[0]):
@@ -253,6 +269,9 @@ class HealthBot:
 
     async def _cb_record(self, callback: CallbackQuery, state: FSMContext) -> None:
         try:
+            if callback.from_user is None:
+                await callback.answer()
+                return
             parts = callback.data.split(":")
             metric_id = int(parts[1])
             value = int(parts[2])

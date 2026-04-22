@@ -11,7 +11,11 @@ async def check_reminders(db: Database, bot: HealthBot) -> None:
     try:
         now_utc = datetime.now(timezone.utc)
         all_metrics = await db.get_all_metrics_with_reminder()
-        for metric in all_metrics:
+    except Exception:
+        logger.exception("Error fetching metrics for reminders")
+        return
+    for metric in all_metrics:
+        try:
             user_tz = parse_timezone(metric["timezone"])
             now_local = now_utc.astimezone(user_tz)
             current_hhmm = now_local.strftime("%H:%M")
@@ -23,8 +27,8 @@ async def check_reminders(db: Database, bot: HealthBot) -> None:
             await bot.send_reminder(metric["user_id"], metric)
             await db.set_last_reminded_date(metric["id"], today_local)
             logger.info("Sent reminder: user={} metric={}", metric["user_id"], metric["name"])
-    except Exception:
-        logger.exception("Error in check_reminders")
+        except Exception:
+            logger.exception("Failed reminder for metric {}", metric["id"])
 
 
 class ReminderScheduler:

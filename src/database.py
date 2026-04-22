@@ -53,7 +53,7 @@ class Database:
 
     # --- Users ---
 
-    async def get_or_create_user(self, user_id: int, timezone: str = "+03:00") -> dict:
+    async def get_or_create_user(self, user_id: int, timezone: str) -> dict:
         now = int(datetime.now(tz=dt_timezone.utc).timestamp())
         await self._db.execute(
             "INSERT OR IGNORE INTO users (user_id, timezone, created_at) VALUES (?, ?, ?)",
@@ -105,8 +105,9 @@ class Database:
             return [dict(r) for r in rows]
 
     async def get_metric_by_name(self, user_id: int, name: str) -> dict | None:
+        name = name.lower()
         async with self._db.execute(
-            "SELECT * FROM metrics WHERE user_id = ? AND name = lower(?)", (user_id, name)
+            "SELECT * FROM metrics WHERE user_id = ? AND name = ?", (user_id, name)
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
@@ -117,8 +118,9 @@ class Database:
             return dict(row) if row else None
 
     async def delete_metric(self, user_id: int, name: str) -> bool:
+        name = name.lower()
         cur = await self._db.execute(
-            "DELETE FROM metrics WHERE user_id = ? AND name = lower(?)", (user_id, name)
+            "DELETE FROM metrics WHERE user_id = ? AND name = ?", (user_id, name)
         )
         await self._db.commit()
         deleted = cur.rowcount > 0
