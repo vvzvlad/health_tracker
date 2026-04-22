@@ -50,7 +50,10 @@ def _build_value_keyboard(metric_id: int) -> InlineKeyboardMarkup:
 class HealthBot:
     def __init__(self, db: Database):
         self.db = db
-        self.bot = Bot(token=settings.telegram_bot_token)
+        bot_kwargs = {"token": settings.telegram_bot_token}
+        if settings.telegram_api_server:
+            bot_kwargs["base_url"] = settings.telegram_api_server
+        self.bot = Bot(**bot_kwargs)
         self.dp = Dispatcher(storage=MemoryStorage())
 
         router = Router()
