@@ -23,28 +23,42 @@ from src.utils import parse_timezone
 
 HELP_TEXT = """Health Tracker Bot
 
-/add <metric> [HH:MM] — add metric with optional daily reminder
-  /add mood 09:00
-  /add stool
+/add — add a new metric (with optional daily reminder)
 /list — list your metrics
-/track <metric> [0-5] — record a value
-  /track mood 4
-  /track stool
+/track — record a value for a metric
 /delete <metric> — remove metric and all its data
 /export [metric] — download CSV
 /timezone ±HH:MM — set your timezone"""
 
 
+class AddStates(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_time = State()
+
+
 class TrackStates(StatesGroup):
+    waiting_for_metric = State()
     waiting_for_value = State()
 
 
 def _build_value_keyboard(metric_id: int) -> InlineKeyboardMarkup:
-    buttons = [
+    row1 = [
         InlineKeyboardButton(text=str(i), callback_data=f"record:{metric_id}:{i}")
-        for i in range(6)
+        for i in range(-5, 0)
     ]
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    row2 = [
+        InlineKeyboardButton(text=str(i), callback_data=f"record:{metric_id}:{i}")
+        for i in range(0, 6)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+
+
+def _build_metrics_keyboard(metrics: list[dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=m["name"], callback_data=f"pick_metric:{m['id']}:{m['name']}")]
+        for m in metrics
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 class HealthBot:
@@ -65,7 +79,13 @@ class HealthBot:
         router.message.register(self._cmd_track, Command("track"))
         router.message.register(self._cmd_export, Command("export"))
         router.message.register(self._cmd_timezone, Command("timezone"))
+
+        router.message.register(self._fsm_add_name, AddStates.waiting_for_name)
+        router.message.register(self._fsm_add_time, AddStates.waiting_for_time)
+        router.message.register(self._fsm_track_metric, TrackStates.waiting_for_metric)
         router.message.register(self._fsm_value_input, TrackStates.waiting_for_value)
+
+        router.callback_query.register(self._cb_pick_metric, F.data.startswith("pick_metric:"))
         router.callback_query.register(self._cb_record, F.data.startswith("record:"))
 
         self.dp.include_router(router)
@@ -74,7 +94,7 @@ class HealthBot:
         await self.dp.start_polling(self.bot)
 
     async def send_reminder(self, user_id: int, metric: dict) -> None:
-        text = f"How is your {metric['name']}? (0 — bad, 5 — great)"
+        text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)"
         keyboard = _build_value_keyboard(metric["id"])
         await self.bot.send_message(user_id, text, reply_markup=keyboard)
 
@@ -90,35 +110,71 @@ class HealthBot:
             logger.warning("Error in /start: {}", e)
             await message.answer("Error occurred.")
 
-    async def _cmd_add(self, message: Message) -> None:
+    async def _cmd_add(self, message: Message, state: FSMContext) -> None:
         try:
             if message.from_user is None:
                 return
             user_id = message.from_user.id
-            args = message.text.split()[1:]
-            if not args:
-                await message.answer("Usage: /add <metric> [HH:MM]")
-                return
-            name = args[0]
-            remind_time = None
-            if len(args) >= 2 and re.match(r'^\d{2}:\d{2}$', args[1]):
-                try:
-                    datetime.strptime(args[1], "%H:%M")
-                    remind_time = args[1]
-                except ValueError:
-                    await message.answer("Invalid time. Use HH:MM format (e.g. 09:00)")
-                    return
             await self.db.get_or_create_user(user_id, settings.default_timezone)
+            await state.set_state(AddStates.waiting_for_name)
+            await message.answer("Enter the metric name:")
+        except Exception as e:
+            logger.warning("Error in /add: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _fsm_add_name(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            name = message.text.strip().lower()
+            if not name:
+                await message.answer("Name cannot be empty. Enter the metric name:")
+                return
+            user_id = message.from_user.id
+            existing = await self.db.get_metric_by_name(user_id, name)
+            if existing is not None:
+                await message.answer(f'Metric "{name}" already exists. Enter a different name:')
+                return
+            await state.update_data(metric_name=name)
+            await state.set_state(AddStates.waiting_for_time)
+            await message.answer(
+                f"Metric: {name}\nEnter daily reminder time in HH:MM format, or send — to skip:"
+            )
+        except Exception as e:
+            logger.warning("Error in FSM add name: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _fsm_add_time(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            text = message.text.strip()
+            data = await state.get_data()
+            name = data["metric_name"]
+            user_id = message.from_user.id
+
+            remind_time = None
+            if text.strip() not in ("—", "-", "skip", "none", ""):
+                if not re.match(r'^\d{2}:\d{2}$', text):
+                    await message.answer("Invalid format. Enter HH:MM or — to skip:")
+                    return
+                try:
+                    datetime.strptime(text, "%H:%M")
+                    remind_time = text
+                except ValueError:
+                    await message.answer("Invalid time. Enter HH:MM or — to skip:")
+                    return
+
             result = await self.db.add_metric(user_id, name, remind_time)
+            await state.clear()
             if result is None:
                 await message.answer(f'Metric "{name}" already exists')
-                return
-            if remind_time:
+            elif remind_time:
                 await message.answer(f"Added: {name}, reminder at {remind_time}")
             else:
                 await message.answer(f"Added: {name} (no reminder)")
         except Exception as e:
-            logger.warning("Error in /add: {}", e)
+            logger.warning("Error in FSM add time: {}", e)
             await message.answer("Error occurred.")
 
     async def _cmd_list(self, message: Message) -> None:
@@ -165,54 +221,83 @@ class HealthBot:
             if message.from_user is None:
                 return
             user_id = message.from_user.id
-            args = message.text.split()[1:]
-            if not args:
-                await message.answer("Usage: /track <metric> [0-5]")
+            metrics = await self.db.get_metrics(user_id)
+            if not metrics:
+                await message.answer("No metrics yet. Use /add")
                 return
-            name = args[0]
-            metric = await self.db.get_metric_by_name(user_id, name)
-            if metric is None:
-                await message.answer(f'Metric "{name}" not found')
-                return
-            if len(args) >= 2:
-                try:
-                    value = int(args[1])
-                except ValueError:
-                    await message.answer("Value must be a number from 0 to 5")
-                    return
-                if value < 0 or value > 5:
-                    await message.answer("Value must be between 0 and 5")
-                    return
-                await self.db.add_record(user_id, metric["id"], value)
-                await message.answer(f"✅ {name}: {value}")
-            else:
-                await state.set_data({"metric_id": metric["id"], "metric_name": metric["name"]})
-                await state.set_state(TrackStates.waiting_for_value)
-                keyboard = _build_value_keyboard(metric["id"])
-                await message.answer(
-                    f"How is your {metric['name']}? (0 — bad, 5 — great)",
-                    reply_markup=keyboard,
-                )
+            await state.set_state(TrackStates.waiting_for_metric)
+            keyboard = _build_metrics_keyboard(metrics)
+            await message.answer("Choose a metric:", reply_markup=keyboard)
         except Exception as e:
             logger.warning("Error in /track: {}", e)
             await message.answer("Error occurred.")
+
+    async def _fsm_track_metric(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            user_id = message.from_user.id
+            name = message.text.strip().lower()
+            metric = await self.db.get_metric_by_name(user_id, name)
+            if metric is None:
+                await message.answer(f'Metric "{name}" not found. Choose from the list or send the name:')
+                return
+            await state.update_data(metric_id=metric["id"], metric_name=metric["name"])
+            await state.set_state(TrackStates.waiting_for_value)
+            keyboard = _build_value_keyboard(metric["id"])
+            await message.answer(
+                f"How is your {metric['name']}? (-5 — very bad, +5 — great)",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.warning("Error in FSM track metric: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _cb_pick_metric(self, callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            if callback.from_user is None:
+                await callback.answer()
+                return
+            parts = callback.data.split(":", 2)
+            metric_id = int(parts[1])
+            metric_name = parts[2]
+            user_id = callback.from_user.id
+            metric = await self.db.get_metric_by_id(metric_id)
+            if metric is None or metric["user_id"] != user_id:
+                await callback.answer("Not your metric")
+                return
+            await state.update_data(metric_id=metric_id, metric_name=metric_name)
+            await state.set_state(TrackStates.waiting_for_value)
+            keyboard = _build_value_keyboard(metric_id)
+            await callback.message.edit_text(
+                f"How is your {metric_name}? (-5 — very bad, +5 — great)",
+                reply_markup=keyboard,
+            )
+            await callback.answer()
+        except Exception as e:
+            logger.warning("Error in callback pick_metric: {}", e)
+            await callback.answer("Error")
 
     async def _fsm_value_input(self, message: Message, state: FSMContext) -> None:
         try:
             if message.from_user is None:
                 return
             text = message.text.strip()
-            if text in {"0", "1", "2", "3", "4", "5"}:
+            try:
                 value = int(text)
-                data = await state.get_data()
-                metric_id = data["metric_id"]
-                metric_name = data["metric_name"]
-                user_id = message.from_user.id
-                await self.db.add_record(user_id, metric_id, value)
-                await state.clear()
-                await message.answer(f"✅ {metric_name}: {value}")
-            else:
-                await message.answer("Please send a number from 0 to 5")
+            except ValueError:
+                await message.answer("Please send a number from -5 to 5")
+                return
+            if value < -5 or value > 5:
+                await message.answer("Please send a number from -5 to 5")
+                return
+            data = await state.get_data()
+            metric_id = data["metric_id"]
+            metric_name = data["metric_name"]
+            user_id = message.from_user.id
+            await self.db.add_record(user_id, metric_id, value)
+            await state.clear()
+            await message.answer(f"✅ {metric_name}: {value:+d}")
         except Exception as e:
             logger.warning("Error in FSM value input: {}", e)
             await message.answer("Error occurred.")
@@ -283,10 +368,9 @@ class HealthBot:
             if metric is None or metric["user_id"] != user_id:
                 await callback.answer("Not your metric")
                 return
-            await self.db.get_or_create_user(user_id, settings.default_timezone)
             await self.db.add_record(user_id, metric_id, value)
             metric_name = metric["name"]
-            await callback.message.edit_text(f"✅ {metric_name}: {value}", reply_markup=None)
+            await callback.message.edit_text(f"✅ {metric_name}: {value:+d}", reply_markup=None)
             await callback.answer()
             current_state = await state.get_state()
             if current_state == TrackStates.waiting_for_value:

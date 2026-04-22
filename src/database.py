@@ -39,7 +39,7 @@ class Database:
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
                 metric_id   INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
-                value       INTEGER NOT NULL CHECK(value BETWEEN 0 AND 5),
+                value       INTEGER NOT NULL CHECK(value BETWEEN -5 AND 5),
                 recorded_at INTEGER NOT NULL
             )
         """)
