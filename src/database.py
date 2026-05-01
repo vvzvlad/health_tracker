@@ -123,6 +123,26 @@ class Database:
             row = await cur.fetchone()
             return dict(row) if row else None
 
+    async def update_metric_name(self, metric_id: int, user_id: int, new_name: str) -> bool:
+        new_name = new_name.lower()
+        try:
+            cur = await self._db.execute(
+                "UPDATE metrics SET name = ? WHERE id = ? AND user_id = ?",
+                (new_name, metric_id, user_id),
+            )
+            await self._db.commit()
+            return cur.rowcount > 0
+        except aiosqlite.IntegrityError:
+            return False
+
+    async def update_metric_description(self, metric_id: int, user_id: int, description: str | None) -> bool:
+        cur = await self._db.execute(
+            "UPDATE metrics SET description = ? WHERE id = ? AND user_id = ?",
+            (description, metric_id, user_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
     async def delete_metric(self, user_id: int, name: str) -> bool:
         name = name.lower()
         cur = await self._db.execute(

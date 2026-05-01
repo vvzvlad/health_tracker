@@ -27,6 +27,7 @@ HELP_TEXT = """Health Tracker Bot
 /add — add a new metric (with optional daily reminder)
 /list — list your metrics
 /track — record a value for a metric
+/edit — edit metric name or description
 /delete <metric> — remove metric and all its data
 /export [metric] — download CSV
 /timezone ±HH:MM — set your timezone"""
@@ -40,6 +41,12 @@ class AddStates(StatesGroup):
 
 class TrackStates(StatesGroup):
     waiting_for_metric = State()
+    waiting_for_value = State()
+
+
+class EditStates(StatesGroup):
+    waiting_for_metric = State()
+    waiting_for_field = State()
     waiting_for_value = State()
 
 
@@ -69,6 +76,24 @@ def _build_metrics_keyboard(metrics: list[dict]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _build_edit_metrics_keyboard(metrics: list[dict]) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=m["name"], callback_data=f"edit_pick:{m['id']}")]
+        for m in metrics
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _build_edit_field_keyboard(metric_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Name", callback_data=f"edit_field:{metric_id}:name"),
+            InlineKeyboardButton(text="Description", callback_data=f"edit_field:{metric_id}:description"),
+        ],
+        [InlineKeyboardButton(text="← Back", callback_data="edit_back")],
+    ])
+
+
 class HealthBot:
     def __init__(self, db: Database):
         self.db = db
@@ -85,6 +110,7 @@ class HealthBot:
         router.message.register(self._cmd_list, Command("list"))
         router.message.register(self._cmd_delete, Command("delete"))
         router.message.register(self._cmd_track, Command("track"))
+        router.message.register(self._cmd_edit, Command("edit"))
         router.message.register(self._cmd_export, Command("export"))
         router.message.register(self._cmd_timezone, Command("timezone"))
 
@@ -93,9 +119,13 @@ class HealthBot:
         router.message.register(self._fsm_add_time, AddStates.waiting_for_time)
         router.message.register(self._fsm_track_metric, TrackStates.waiting_for_metric)
         router.message.register(self._fsm_value_input, TrackStates.waiting_for_value)
+        router.message.register(self._fsm_edit_value, EditStates.waiting_for_value)
 
         router.callback_query.register(self._cb_pick_metric, F.data.startswith("pick_metric:"))
         router.callback_query.register(self._cb_record, F.data.startswith("record:"))
+        router.callback_query.register(self._cb_edit_pick, F.data.startswith("edit_pick:"))
+        router.callback_query.register(self._cb_edit_field, F.data.startswith("edit_field:"))
+        router.callback_query.register(self._cb_edit_back, F.data == "edit_back")
 
         self.dp.include_router(router)
 
@@ -105,6 +135,7 @@ class HealthBot:
             BotCommand(command="add", description="Add a new metric"),
             BotCommand(command="list", description="List your metrics"),
             BotCommand(command="track", description="Record a value for a metric"),
+            BotCommand(command="edit", description="Edit metric name or description"),
             BotCommand(command="delete", description="Remove metric and all its data"),
             BotCommand(command="export", description="Download CSV export"),
             BotCommand(command="timezone", description="Set your timezone (±HH:MM)"),
@@ -348,6 +379,115 @@ class HealthBot:
             await message.answer(f"✅ {metric_name}: {value:+d}")
         except Exception as e:
             logger.warning("Error in FSM value input: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _cmd_edit(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            user_id = message.from_user.id
+            metrics = await self.db.get_metrics(user_id)
+            if not metrics:
+                await message.answer("No metrics yet. Use /add")
+                return
+            await state.set_state(EditStates.waiting_for_metric)
+            keyboard = _build_edit_metrics_keyboard(metrics)
+            await message.answer("Choose a metric to edit:", reply_markup=keyboard)
+        except Exception as e:
+            logger.warning("Error in /edit: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _cb_edit_pick(self, callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            if callback.from_user is None:
+                await callback.answer()
+                return
+            metric_id = int(callback.data.split(":")[1])
+            user_id = callback.from_user.id
+            metric = await self.db.get_metric_by_id(metric_id)
+            if metric is None or metric["user_id"] != user_id:
+                await callback.answer("Not your metric")
+                return
+            await state.update_data(edit_metric_id=metric_id, edit_metric_name=metric["name"])
+            await state.set_state(EditStates.waiting_for_field)
+            keyboard = _build_edit_field_keyboard(metric_id)
+            desc = metric.get("description") or "—"
+            await callback.message.edit_text(
+                f"Metric: {metric['name']}\nDescription: {desc}\n\nWhat to edit?",
+                reply_markup=keyboard,
+            )
+            await callback.answer()
+        except Exception as e:
+            logger.warning("Error in cb_edit_pick: {}", e)
+            await callback.answer("Error")
+
+    async def _cb_edit_field(self, callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            if callback.from_user is None:
+                await callback.answer()
+                return
+            parts = callback.data.split(":")
+            metric_id = int(parts[1])
+            field = parts[2]
+            user_id = callback.from_user.id
+            metric = await self.db.get_metric_by_id(metric_id)
+            if metric is None or metric["user_id"] != user_id:
+                await callback.answer("Not your metric")
+                return
+            await state.update_data(edit_metric_id=metric_id, edit_field=field)
+            await state.set_state(EditStates.waiting_for_value)
+            prompts = {"name": "Enter new name:", "description": "Enter new description (or — to clear):"}
+            await callback.message.edit_text(prompts[field], reply_markup=None)
+            await callback.answer()
+        except Exception as e:
+            logger.warning("Error in cb_edit_field: {}", e)
+            await callback.answer("Error")
+
+    async def _cb_edit_back(self, callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            if callback.from_user is None:
+                await callback.answer()
+                return
+            user_id = callback.from_user.id
+            metrics = await self.db.get_metrics(user_id)
+            await state.set_state(EditStates.waiting_for_metric)
+            keyboard = _build_edit_metrics_keyboard(metrics)
+            await callback.message.edit_text("Choose a metric to edit:", reply_markup=keyboard)
+            await callback.answer()
+        except Exception as e:
+            logger.warning("Error in cb_edit_back: {}", e)
+            await callback.answer("Error")
+
+    async def _fsm_edit_value(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            data = await state.get_data()
+            metric_id = data["edit_metric_id"]
+            field = data["edit_field"]
+            user_id = message.from_user.id
+            text = message.text.strip()
+
+            if field == "name":
+                if not text:
+                    await message.answer("Name cannot be empty.")
+                    return
+                ok = await self.db.update_metric_name(metric_id, user_id, text)
+                if ok:
+                    await state.clear()
+                    await message.answer(f"✅ Name updated to: {text.lower()}")
+                else:
+                    await message.answer(f'Metric with name "{text.lower()}" already exists. Enter a different name:')
+            elif field == "description":
+                description = None if text in ("—", "-", "skip", "none", "") else text
+                await self.db.update_metric_description(metric_id, user_id, description)
+                await state.clear()
+                if description:
+                    await message.answer(f"✅ Description updated: {description}")
+                else:
+                    await message.answer("✅ Description cleared.")
+        except Exception as e:
+            logger.warning("Error in fsm_edit_value: {}", e)
             await message.answer("Error occurred.")
 
     async def _cmd_export(self, message: Message) -> None:
