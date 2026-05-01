@@ -159,6 +159,14 @@ class Database:
         logger.info("Added record: user={} metric_id={} value={}", user_id, metric_id, value)
         return {"id": record_id, "user_id": user_id, "metric_id": metric_id, "value": value, "recorded_at": recorded_at}
 
+    async def get_last_records(self, metric_id: int, limit: int = 10) -> list[dict]:
+        async with self._db.execute(
+            "SELECT value, recorded_at FROM records WHERE metric_id = ? ORDER BY recorded_at DESC LIMIT ?",
+            (metric_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in reversed(rows)]
+
     async def get_records(self, user_id: int, metric_name: str | None = None) -> list[dict]:
         if metric_name is not None:
             sql = """

@@ -54,6 +54,12 @@ def _build_value_keyboard(metric_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
 
 
+def _format_history(records: list[dict]) -> str:
+    if not records:
+        return "no history"
+    return " ".join(f"{r['value']:+d}" for r in records)
+
+
 def _build_metrics_keyboard(metrics: list[dict]) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=m["name"], callback_data=f"pick_metric:{m['id']}:{m['name']}")]
@@ -104,7 +110,9 @@ class HealthBot:
         await self.dp.start_polling(self.bot)
 
     async def send_reminder(self, user_id: int, metric: dict) -> None:
-        text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)"
+        history = await self.db.get_last_records(metric["id"])
+        history_str = _format_history(history)
+        text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}"
         keyboard = _build_value_keyboard(metric["id"])
         await self.bot.send_message(user_id, text, reply_markup=keyboard)
 
@@ -255,8 +263,10 @@ class HealthBot:
             await state.update_data(metric_id=metric["id"], metric_name=metric["name"])
             await state.set_state(TrackStates.waiting_for_value)
             keyboard = _build_value_keyboard(metric["id"])
+            history = await self.db.get_last_records(metric["id"])
+            history_str = _format_history(history)
             await message.answer(
-                f"How is your {metric['name']}? (-5 — very bad, +5 — great)",
+                f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}",
                 reply_markup=keyboard,
             )
         except Exception as e:
@@ -279,8 +289,10 @@ class HealthBot:
             await state.update_data(metric_id=metric_id, metric_name=metric_name)
             await state.set_state(TrackStates.waiting_for_value)
             keyboard = _build_value_keyboard(metric_id)
+            history = await self.db.get_last_records(metric_id)
+            history_str = _format_history(history)
             await callback.message.edit_text(
-                f"How is your {metric_name}? (-5 — very bad, +5 — great)",
+                f"How is your {metric_name}? (-5 — very bad, +5 — great)\nLast 10: {history_str}",
                 reply_markup=keyboard,
             )
             await callback.answer()
