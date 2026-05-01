@@ -9,6 +9,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
@@ -91,6 +92,15 @@ class HealthBot:
         self.dp.include_router(router)
 
     async def start(self):
+        await self.bot.set_my_commands([
+            BotCommand(command="start", description="Show help"),
+            BotCommand(command="add", description="Add a new metric"),
+            BotCommand(command="list", description="List your metrics"),
+            BotCommand(command="track", description="Record a value for a metric"),
+            BotCommand(command="delete", description="Remove metric and all its data"),
+            BotCommand(command="export", description="Download CSV export"),
+            BotCommand(command="timezone", description="Set your timezone (±HH:MM)"),
+        ])
         await self.dp.start_polling(self.bot)
 
     async def send_reminder(self, user_id: int, metric: dict) -> None:
