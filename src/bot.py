@@ -34,6 +34,7 @@ HELP_TEXT = """Health Tracker Bot
 
 class AddStates(StatesGroup):
     waiting_for_name = State()
+    waiting_for_description = State()
     waiting_for_time = State()
 
 
@@ -88,6 +89,7 @@ class HealthBot:
         router.message.register(self._cmd_timezone, Command("timezone"))
 
         router.message.register(self._fsm_add_name, AddStates.waiting_for_name)
+        router.message.register(self._fsm_add_description, AddStates.waiting_for_description)
         router.message.register(self._fsm_add_time, AddStates.waiting_for_time)
         router.message.register(self._fsm_track_metric, TrackStates.waiting_for_metric)
         router.message.register(self._fsm_value_input, TrackStates.waiting_for_value)
@@ -112,7 +114,9 @@ class HealthBot:
     async def send_reminder(self, user_id: int, metric: dict) -> None:
         history = await self.db.get_last_records(metric["id"])
         history_str = _format_history(history)
-        text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}"
+        desc = metric.get("description")
+        desc_line = f"\n{desc}" if desc else ""
+        text = f"How is your {metric['name']}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}"
         keyboard = _build_value_keyboard(metric["id"])
         await self.bot.send_message(user_id, text, reply_markup=keyboard)
 
@@ -154,12 +158,29 @@ class HealthBot:
                 await message.answer(f'Metric "{name}" already exists. Enter a different name:')
                 return
             await state.update_data(metric_name=name)
+            await state.set_state(AddStates.waiting_for_description)
+            await message.answer(
+                f"Metric: {name}\nEnter description (shown when tracking), or send — to skip:"
+            )
+        except Exception as e:
+            logger.warning("Error in FSM add name: {}", e)
+            await message.answer("Error occurred.")
+
+    async def _fsm_add_description(self, message: Message, state: FSMContext) -> None:
+        try:
+            if message.from_user is None:
+                return
+            text = message.text.strip()
+            description = None if text in ("—", "-", "skip", "none", "") else text
+            await state.update_data(metric_description=description)
             await state.set_state(AddStates.waiting_for_time)
+            data = await state.get_data()
+            name = data["metric_name"]
             await message.answer(
                 f"Metric: {name}\nEnter daily reminder time in HH:MM format, or send — to skip:"
             )
         except Exception as e:
-            logger.warning("Error in FSM add name: {}", e)
+            logger.warning("Error in FSM add description: {}", e)
             await message.answer("Error occurred.")
 
     async def _fsm_add_time(self, message: Message, state: FSMContext) -> None:
@@ -169,6 +190,7 @@ class HealthBot:
             text = message.text.strip()
             data = await state.get_data()
             name = data["metric_name"]
+            description = data.get("metric_description")
             user_id = message.from_user.id
 
             remind_time = None
@@ -183,7 +205,7 @@ class HealthBot:
                     await message.answer("Invalid time. Enter HH:MM or — to skip:")
                     return
 
-            result = await self.db.add_metric(user_id, name, remind_time)
+            result = await self.db.add_metric(user_id, name, remind_time, description)
             await state.clear()
             if result is None:
                 await message.answer(f'Metric "{name}" already exists')
@@ -265,8 +287,10 @@ class HealthBot:
             keyboard = _build_value_keyboard(metric["id"])
             history = await self.db.get_last_records(metric["id"])
             history_str = _format_history(history)
+            desc = metric.get("description")
+            desc_line = f"\n{desc}" if desc else ""
             await message.answer(
-                f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}",
+                f"How is your {metric['name']}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}",
                 reply_markup=keyboard,
             )
         except Exception as e:
@@ -291,8 +315,10 @@ class HealthBot:
             keyboard = _build_value_keyboard(metric_id)
             history = await self.db.get_last_records(metric_id)
             history_str = _format_history(history)
+            desc = metric.get("description")
+            desc_line = f"\n{desc}" if desc else ""
             await callback.message.edit_text(
-                f"How is your {metric_name}? (-5 — very bad, +5 — great)\nLast 10: {history_str}",
+                f"How is your {metric_name}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}",
                 reply_markup=keyboard,
             )
             await callback.answer()

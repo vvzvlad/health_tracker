@@ -28,12 +28,18 @@ class Database:
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id            INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
                 name               TEXT NOT NULL,
+                description        TEXT,
                 remind_time        TEXT,
                 last_reminded_date TEXT,
                 created_at         INTEGER NOT NULL,
                 UNIQUE(user_id, name)
             )
         """)
+        try:
+            await self._db.execute("ALTER TABLE metrics ADD COLUMN description TEXT")
+            await self._db.commit()
+        except Exception:
+            pass
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS records (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,13 +84,13 @@ class Database:
 
     # --- Metrics ---
 
-    async def add_metric(self, user_id: int, name: str, remind_time: str | None) -> dict | None:
+    async def add_metric(self, user_id: int, name: str, remind_time: str | None, description: str | None = None) -> dict | None:
         now = int(datetime.now(tz=dt_timezone.utc).timestamp())
         name = name.lower()
         try:
             await self._db.execute(
-                "INSERT INTO metrics (user_id, name, remind_time, created_at) VALUES (?, ?, ?, ?)",
-                (user_id, name, remind_time, now),
+                "INSERT INTO metrics (user_id, name, description, remind_time, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, name, description, remind_time, now),
             )
             await self._db.commit()
         except aiosqlite.IntegrityError:
