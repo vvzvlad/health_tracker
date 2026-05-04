@@ -40,6 +40,30 @@ class Database:
             await self._db.commit()
         except Exception:
             pass
+        # Migration: if the records table exists with the old CHECK constraint
+        # (BETWEEN 0 AND 5), rename it, recreate with the correct constraint,
+        # copy data over, and drop the old table.
+        async with self._db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='records'"
+        ) as cur:
+            row = await cur.fetchone()
+        if row is not None and "between 0 and 5" in row[0].lower():
+            await self._db.execute("PRAGMA foreign_keys=OFF")
+            await self._db.execute("ALTER TABLE records RENAME TO records_old")
+            await self._db.execute("""
+                CREATE TABLE records (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id     INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                    metric_id   INTEGER NOT NULL REFERENCES metrics(id) ON DELETE CASCADE,
+                    value       INTEGER NOT NULL CHECK(value BETWEEN -5 AND 5),
+                    recorded_at INTEGER NOT NULL
+                )
+            """)
+            await self._db.execute("INSERT INTO records SELECT * FROM records_old")
+            await self._db.execute("DROP TABLE records_old")
+            await self._db.commit()
+            await self._db.execute("PRAGMA foreign_keys=ON")
+            logger.info("Migrated records table: updated CHECK constraint from BETWEEN 0 AND 5 to BETWEEN -5 AND 5")
         await self._db.execute("""
             CREATE TABLE IF NOT EXISTS records (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
