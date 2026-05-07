@@ -146,8 +146,10 @@ class HealthBot:
         history = await self.db.get_last_records(metric["id"])
         history_str = _format_history(history)
         desc = metric.get("description")
-        desc_line = f"\n{desc}" if desc else ""
-        text = f"How is your {metric['name']}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}"
+        if desc:
+            text = f"How is your {metric['name']}?\n{desc}\nLast 10: {history_str}"
+        else:
+            text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}"
         keyboard = _build_value_keyboard(metric["id"])
         await self.bot.send_message(user_id, text, reply_markup=keyboard)
 
@@ -319,11 +321,11 @@ class HealthBot:
             history = await self.db.get_last_records(metric["id"])
             history_str = _format_history(history)
             desc = metric.get("description")
-            desc_line = f"\n{desc}" if desc else ""
-            await message.answer(
-                f"How is your {metric['name']}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}",
-                reply_markup=keyboard,
-            )
+            if desc:
+                track_text = f"How is your {metric['name']}?\n{desc}\nLast 10: {history_str}"
+            else:
+                track_text = f"How is your {metric['name']}? (-5 — very bad, +5 — great)\nLast 10: {history_str}"
+            await message.answer(track_text, reply_markup=keyboard)
         except Exception as e:
             logger.warning("Error in FSM track metric: {}", e)
             await message.answer("Error occurred.")
@@ -347,11 +349,11 @@ class HealthBot:
             history = await self.db.get_last_records(metric_id)
             history_str = _format_history(history)
             desc = metric.get("description")
-            desc_line = f"\n{desc}" if desc else ""
-            await callback.message.edit_text(
-                f"How is your {metric_name}?{desc_line}\n(-5 — very bad, +5 — great)\nLast 10: {history_str}",
-                reply_markup=keyboard,
-            )
+            if desc:
+                track_text = f"How is your {metric_name}?\n{desc}\nLast 10: {history_str}"
+            else:
+                track_text = f"How is your {metric_name}? (-5 — very bad, +5 — great)\nLast 10: {history_str}"
+            await callback.message.edit_text(track_text, reply_markup=keyboard)
             await callback.answer()
         except Exception as e:
             logger.warning("Error in callback pick_metric: {}", e)
