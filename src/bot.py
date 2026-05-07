@@ -51,15 +51,11 @@ class EditStates(StatesGroup):
 
 
 def _build_value_keyboard(metric_id: int) -> InlineKeyboardMarkup:
-    row1 = [
+    row = [
         InlineKeyboardButton(text=str(i), callback_data=f"record:{metric_id}:{i}")
-        for i in range(-5, 0)
+        for i in range(-5, 6)
     ]
-    row2 = [
-        InlineKeyboardButton(text=str(i), callback_data=f"record:{metric_id}:{i}")
-        for i in range(0, 6)
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2])
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def _format_history(records: list[dict]) -> str:
