@@ -185,9 +185,14 @@ class HealthBot:
         WHAT IT COSTS, since `healthy` now waits for a network round trip: worked out in full over
         the HEALTHCHECK line in the Dockerfile, against a probe schedule measured on the production
         daemon rather than assumed. The short of it — with the Bot API answering in milliseconds
-        NOTHING MOVES, because the mark is on disk before the first probe at ~5 s; the request has
-        to exceed ~28 s to cost anything at all; it cannot exceed 60 s without raising; and the
-        worst SUCCESSFUL start is still about 30 s inside the updater's window.
+        NOTHING MOVES, because the mark is on disk before the first probe at ~5 s. A slower answer
+        only moves `healthy` along the 5 s cadence docker probes at while the start period runs: a
+        10 s request puts the mark at ~12 s and `healthy` at the +15 s probe instead of the +5 s
+        one. ~28 s is the threshold for something else entirely, and it is the one worth keeping —
+        past it the mark falls OUTSIDE the start period, so the next probe to see it is the +60 s
+        one; that, and not any shift at all, is what the updater's window is at risk from. The
+        request cannot exceed 60 s without raising, and the worst SUCCESSFUL start is still about
+        30 s inside that window.
         """
         await self.bot.set_my_commands([
             BotCommand(command="start", description="Show help"),

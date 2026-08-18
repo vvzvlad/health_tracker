@@ -76,6 +76,17 @@ class Settings(BaseSettings):
         as long as the container is redeployed. It would buy little: aiogram's own
         `validate_token` rejects a malformed token at `Bot(...)` with "Token is invalid!", after
         logging is configured and without quoting the value.
+
+        THAT COVERS THE EMPTY TOKEN TOO, which is the case that looks most like the blank server
+        address above — `TELEGRAM_BOT_TOKEN=` declared in a compose file and left empty, accepted
+        here because it is a perfectly good `str`. An emptiness check would not leak anything (an
+        empty string is safe for pydantic to echo), so the argument above does not apply to it —
+        and it is still not worth having: it would move a failure that currently arrives READABLE,
+        through the configured sink, into the one place that cannot report it, and it would cover
+        a strict subset of what `validate_token` already refuses. What the empty token really
+        needed was for that refusal to KILL the container instead of hanging it, which is a
+        property of main.py's `try`/`finally` rather than of this model; ci/smoke.py has a row that
+        runs the real main.py on an empty token and requires it to die.
         """
         if value is None:
             return None

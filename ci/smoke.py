@@ -111,6 +111,12 @@ THE CHECKS
 * (l) the stdlib→loguru bridge really carries a record end to end, redacted: the Dockerfile names
       the log as the only place a permanently failing getUpdates loop appears, and until this row
       existed nothing checked the mechanism that puts it there. Probe (and the real image, via (b)).
+* (m) an EMPTY TELEGRAM_BOT_TOKEN — the compose spelling of a variable that was declared and left
+      blank — kills the process rather than hanging it. aiogram refuses such a token inside
+      `Bot(...)`, i.e. AFTER db.init() has opened a connection on a non-daemon thread, so the whole
+      question is whether main.py closes that connection on the way out: if it does not, the
+      container prints its traceback and then sits there alive, which no restart policy can undo
+      and which `healthy` never contradicts. Checked by running the real main.py. Probe.
 
 Three properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -241,8 +247,8 @@ PROBE_ROW_PREFIX = "[in-image] "
 # does print says ok and it exits 0, so nothing else in this file would notice.
 # 9 modules + 27 imported symbols + 12 methods called on them + 6 handler registration
 # + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 10 health probe
-# + 11 settings + 2 logging bridge.
-EXPECTED_PROBE_TARGETS = 101
+# + 1 empty-token startup + 11 settings + 2 logging bridge.
+EXPECTED_PROBE_TARGETS = 102
 
 # The total this gate produces when everything runs: 24 of its own (8 contract + 2 workflow parity +
 # 6 cloud boot + 8 served boot) + the probe's rows + the two consistency rows run_probe() adds about
@@ -278,11 +284,12 @@ COPY_TIMEOUT = 30
 # to fail can legitimately take: aiogram's per-request timeout is 60 s and there is one request.
 WAIT_TIMEOUT = 90
 # 420, not 300. The probe runs subprocesses of its own and they are bounded too: five runs of
-# `python -m src.healthcheck` at HEALTHCHECK_RUN_TIMEOUT (30 s) plus one Settings import at 60 s
-# come to 210 s in the worst case, and the rest of the probe — importing aiogram, building bots,
-# migrating sqlite files — has to fit in what is left. At 300 the outer bound could fire FIRST and
-# replace a row-by-row report with a single "`docker run` did not finish"; the outer bound must
-# never pre-empt the report it is bounding. 420 leaves ~210 s over the inner sum.
+# `python -m src.healthcheck` at HEALTHCHECK_RUN_TIMEOUT (30 s), one Settings import at 60 s and
+# one real main.py at MAIN_RUN_TIMEOUT (30 s) come to 240 s in the worst case, and the rest of the
+# probe — importing aiogram, building bots, migrating sqlite files — has to fit in what is left. At
+# 300 the outer bound could fire FIRST and replace a row-by-row report with a single "`docker run`
+# did not finish"; the outer bound must never pre-empt the report it is bounding. 420 leaves ~180 s
+# over the inner sum.
 PROBE_TIMEOUT = 420
 
 # How long a container gets to print its startup markers, and how often the log is re-read while
@@ -1156,6 +1163,10 @@ def check_scheduler(workdir):
 # module, opens one file and reads one integer out of it, so 30 s is already absurdly generous -
 # and the number is not free: five of these runs are what the outer PROBE_TIMEOUT has to sit above.
 HEALTHCHECK_RUN_TIMEOUT = 30
+# And the single run of the REAL main.py in check_empty_token_startup gets this many. Unlike every
+# other bound here it is a verdict rather than a safety net: a startup still alive when it expires
+# IS the failure that check exists to find. Generous against the ~1 s a correct one takes.
+MAIN_RUN_TIMEOUT = 30
 # WORKDIR in the image, and the root of everything the Dockerfile copies in. The data volume is
 # mounted below it, which is why the default mark must be outside it altogether.
 APP_DIR_IN_IMAGE = "/app"
@@ -1470,6 +1481,82 @@ def check_health_probe(workdir):
         fail_group(target, error)
 
 
+def check_empty_token_startup(workdir):
+    """(m) An EMPTY TELEGRAM_BOT_TOKEN must KILL this process, not hang it.
+
+    THE FAILURE IS A CONTAINER THAT NEVER EXITS, and it is worse than one that dies: the traceback
+    is already printed, so the log reads like a crash, while the process sits there holding the
+    name - and `restart: unless-stopped` cannot restart something that never stopped. `healthy`
+    never arrives either way, so Portainer's updater still rolls the image back; what is lost is
+    everything that tells a human which of the two happened.
+
+    THE MECHANISM, and it is two ordinary things meeting. `Bot(token=...)` calls aiogram's
+    validate_token as its first statement and raises TokenValidationError on an empty token, on one
+    with no colon, on one with a space in it - and TELEGRAM_BOT_TOKEN= declared in a compose file
+    and left blank is exactly how an empty one is produced, since `telegram_bot_token: str` accepts
+    the empty string and pydantic-settings does not read a blank variable as absent. Meanwhile
+    db.init() has already opened an aiosqlite connection, which runs on a NON-daemon thread. If the
+    raise happens where nothing closes that connection - HealthBot(db) sitting ABOVE main.py's try,
+    which is where it used to sit - the interpreter cannot exit: measured, still alive 25 s after
+    the traceback.
+
+    So this runs the REAL main.py, from this image, with an empty token and a bound, and the bound
+    is the verdict: a timeout here is the failure. The mutation it is here for is moving
+    `HealthBot(db)` and `ReminderScheduler(db, bot)` back outside that try.
+
+    A MISSING token is a different question and has its own row in check_settings: it is refused by
+    pydantic at `import src.settings`, before anything is open. This one is about a token that is
+    present and empty, which pydantic accepts and aiogram does not.
+
+    The reason for the death is checked too, loosely: a main.py that died of something else
+    entirely would otherwise satisfy "it exited" while proving nothing about the hang.
+    """
+    target = "an empty TELEGRAM_BOT_TOKEN kills the process instead of hanging it"
+    directory = os.path.join(workdir, "empty-token")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        env = dict(os.environ)
+        env["TELEGRAM_BOT_TOKEN"] = ""
+        # Both pointed at this check's own scratch directory: the run below really calls
+        # clear_heartbeat() and db.init(), and it must not delete the mark the health-probe rows
+        # staged at the default path nor touch any database they built.
+        env["DATABASE_PATH"] = os.path.join(directory, "health.db")
+        env["HEARTBEAT_FILE"] = os.path.join(directory, "heartbeat")
+        for name in (CONVENTION_NAME, LEGACY_NAME):
+            env.pop(name, None)
+        completed = subprocess.run(
+            [sys.executable, "main.py"],
+            cwd="/app", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=MAIN_RUN_TIMEOUT, text=True)
+    except subprocess.TimeoutExpired as error:
+        # `TimeoutExpired.output` comes back as BYTES even under text=True - verified on python
+        # 3.11.8, which is the image's interpreter - so it is decoded here rather than formatted
+        # into the row as a b'...' blob. This is the branch that reports the failure, and a report
+        # nobody can read is the one thing it must not be.
+        so_far = error.output or ""
+        if isinstance(so_far, bytes):
+            so_far = so_far.decode("utf-8", "replace")
+        record(target, "it was still running {} s after it was started, so it HUNG rather than "
+                       "died. The aiosqlite connection opened by db.init() is on a non-daemon "
+                       "thread and nothing closed it - which is what happens when the object that "
+                       "raises is constructed outside main.py's try. Output so far: {}".format(
+                           MAIN_RUN_TIMEOUT, so_far.strip()[-400:]))
+        return
+    except Exception as error:
+        fail_group(target, error)
+        return
+
+    output = completed.stdout or ""
+    if completed.returncode == 0:
+        record(target, "it exited 0 on an empty token, so the bot would go on running with a "
+                       "token no Bot API will accept: {}".format(output.strip()[-400:]))
+    elif "token is invalid" not in output.lower() and "telegram_bot_token" not in output.lower():
+        record(target, "it died, but for some other reason - so this row is no longer watching the "
+                       "empty-token path at all: {}".format(output.strip()[-400:]))
+    else:
+        record(target)
+
+
 def check_logging_bridge():
     """(l) The stdlib -> loguru bridge, end to end, with the redaction on the way out.
 
@@ -1549,6 +1636,7 @@ def main():
     check_database_migration(workdir)
     check_scheduler(workdir)
     check_health_probe(workdir)
+    check_empty_token_startup(workdir)
     check_settings()
     # Last: it reconfigures logging for the whole process.
     check_logging_bridge()
@@ -2313,13 +2401,13 @@ def main():
 
     # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
     # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 124/124` — three short of the 127 below, and indistinguishable
+    # so the run would end `smoke ok: 125/125` — three short of the 128 below, and indistinguishable
     # from a good run to anybody not counting — exit 0, and have every printed row saying ok with
     # several claims silently no longer made.
     #
     # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
     # failing check legitimately reports fewer rows than its happy path — run_probe emits 1 instead
-    # of the 103 (101 from the probe plus its 2 consistency rows) a green run produces, when its
+    # of the 104 (102 from the probe plus its 2 consistency rows) a green run produces, when its
     # container never started — so on an already-red run this row would fire too, on top of the real
     # failure, and read as though the GATE were broken. The fault it exists to catch is invisible on
     # a red run and decisive on a green one, which is exactly where it is reported.
