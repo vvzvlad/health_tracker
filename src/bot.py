@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timezone as dt_timezone
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -93,10 +95,35 @@ def _build_edit_field_keyboard(metric_id: int) -> InlineKeyboardMarkup:
 class HealthBot:
     def __init__(self, db: Database):
         self.db = db
-        bot_kwargs = {"token": settings.telegram_bot_token}
         if settings.telegram_api_server:
-            bot_kwargs["base_url"] = settings.telegram_api_server
-        self.bot = Bot(**bot_kwargs)
+            # The local Bot API server is configured on the SESSION, not on Bot(). aiogram 3
+            # takes only (token, session, default, **kwargs) and does nothing at all with
+            # anything else it is handed: the `base_url=` this line used to pass was
+            # accepted and dropped on the floor, so the bot kept talking to the cloud even
+            # on the day the variable did reach the process. Two silent failures stacked on
+            # each other — the environment name never arrived (see src/settings.py), and the
+            # value would not have been used if it had.
+            #
+            # is_local is deliberately left at its default False. It tells aiogram that
+            # files named in API responses are readable on this process's own filesystem,
+            # and they are not: telegram-bot-api runs in its own container on internal.lc
+            # (10.31.41.70:8081) while this bot runs on nebula.lc. Nothing here downloads
+            # files today, so the flag only stands to be wrong later.
+            session = AiohttpSession(
+                api=TelegramAPIServer.from_base(settings.telegram_api_server)
+            )
+            self.bot = Bot(token=settings.telegram_bot_token, session=session)
+            # The address is not a secret; the token is, and never reaches the log in any
+            # form. This line exists so that a failure of this class stops being silent: a
+            # stack that passes TELEGRAM_BOT_API_SERVER and a bot that ignores it produced
+            # exactly the same log until somebody opened a python shell inside the container.
+            logger.info("Bot API endpoint: local server {}", settings.telegram_api_server)
+        else:
+            self.bot = Bot(token=settings.telegram_bot_token)
+            logger.info(
+                "Bot API endpoint: cloud default api.telegram.org "
+                "(neither TELEGRAM_BOT_API_SERVER nor TELEGRAM_API_SERVER is set)"
+            )
         self.dp = Dispatcher(storage=MemoryStorage())
 
         router = Router()
