@@ -18,9 +18,13 @@ container lives, and the updater's containers live a long time.
   no handler at all and went out through `logging.lastResort`: stderr, WARNING and above only,
   a different format, and past both LOG_LEVEL and the redaction above. Routing them here is
   also the only reason a polling failure is visible at all: aiogram's
-  `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever,
-  so a bot that can reach nothing keeps its process, its scheduler and its heartbeat, and the
-  healthcheck stays green. The log is where that failure appears, or nowhere.
+  `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever
+  behind a backoff, so a bot whose polling has permanently failed — a 409 because something
+  else started polling the same token, a revoked token, a Bot API server that went away after
+  startup — keeps its process, its scheduler and its heartbeat, and the healthcheck stays
+  green. The log is where that failure appears, or nowhere. (A failure already present at
+  STARTUP does not get that far: `set_my_commands` raises before polling begins and the process
+  dies, which the healthcheck does catch.)
 * sys.excepthook REDACTS TOO. The traceback of an exception that kills the process is printed
   by the interpreter itself and never passes through a handler of any kind.
 
@@ -37,22 +41,31 @@ import traceback
 from loguru import logger
 
 TOKEN_PLACEHOLDER = "***REDACTED***"
-# A bot token is `<numeric id>:<35-character secret>`. Both halves are replaced, because a
-# library that splits the URL may print the secret on its own — but only when the secret is
-# long enough to be unambiguous. Blind-replacing a three-character string inside a log line
-# would corrupt unrelated text, and a token that short is not a real one anyway.
+# The shortest string this will blind-replace throughout a log line. It applies to BOTH the
+# whole token and its secret half, and the bound on the whole token is the one that matters:
+# TELEGRAM_BOT_TOKEN is a plain `str` with no format check, so `TELEGRAM_BOT_TOKEN=test` is a
+# thing a stack can really be given — and replacing every occurrence of `test` in everything
+# this process logs would corrupt arbitrary text, starting with the traceback that says the
+# token is invalid. Below the bound the choice is deliberate: a string that short cannot
+# authenticate anything (a real token is `<numeric id>:<35-character secret>`), so keeping the
+# log readable is worth more than scrubbing it. A real token, and a real token's secret half,
+# are both far above this.
 MIN_SECRET_LENGTH = 8
 
 
 def redact(text, token):
     """Replace the token, and its secret half alone, with a placeholder.
 
+    Both halves, because a library that splits the URL may print the secret on its own.
+
     Returns `text` unchanged when there is nothing to scrub, so callers do not have to care
     whether a token was configured.
     """
     if not text or not token:
         return text
-    result = text.replace(token, TOKEN_PLACEHOLDER)
+    result = text
+    if len(token) >= MIN_SECRET_LENGTH:
+        result = result.replace(token, TOKEN_PLACEHOLDER)
     secret = token.partition(":")[2]
     if len(secret) >= MIN_SECRET_LENGTH:
         result = result.replace(secret, TOKEN_PLACEHOLDER)
@@ -100,10 +113,21 @@ def configure_logging(token, level="INFO"):
     logger.add(sink, level=level)
 
     # `force=True` replaces whatever handlers are already on the root logger, so this is not
-    # additive with a library that configured logging at import time. Level NOTSET lets every
-    # record reach the handler and leaves the filtering to loguru's own sink level, which is
-    # what LOG_LEVEL is supposed to control.
-    logging.basicConfig(handlers=[InterceptHandler()], level=logging.NOTSET, force=True)
+    # additive with a library that configured logging at import time.
+    #
+    # THE LEVEL IS THE REAL ONE, not NOTSET. At NOTSET every DEBUG record any library emits is
+    # built, %-formatted, handed to InterceptHandler and walked frame by frame — all to be
+    # dropped by the sink at the end of it. Setting the root threshold means those records are
+    # never created. loguru's level numbers ARE the stdlib's (DEBUG 10, INFO 20, …), so its own
+    # table is what translates LOG_LEVEL here; it cannot fail, because logger.add() above has
+    # already rejected any name loguru does not know.
+    # A library that sets its OWN logger level lower still gets through — a logger with an
+    # explicit level ignores the root's — and loguru's sink filters it, exactly as before.
+    logging.basicConfig(
+        handlers=[InterceptHandler()],
+        level=logger.level(level).no if isinstance(level, str) else level,
+        force=True,
+    )
 
     def excepthook(exc_type, exc_value, exc_traceback):
         text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))

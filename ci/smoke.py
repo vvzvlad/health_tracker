@@ -53,9 +53,13 @@ THE CHECKS
 * (b) the real CMD reaches its first lines of log, in BOTH branches of the endpoint decision: once
       with no Bot API server configured and once with TELEGRAM_BOT_API_SERVER set. The startup
       heartbeat is checked in ONE of those two containers — the cloud one, whose file is pulled out
-      with `docker cp` and read. The local-server container is started for the other branch of the
-      log line and is not asked about the file; the write is the same code either way. Both have
-      their logs re-read at the end and searched for the token. Outer half.
+      with `docker cp` and read, and which is also asked to prove that NOTHING was written to the
+      data-volume path the mark must never occupy. That container's log is also where the
+      stdlib→loguru bridge is proved in the real image: an apscheduler record, INFO, in loguru's
+      format, which cannot appear at all if the bridge is gone. The local-server container is
+      started for the other branch of the log line and is not asked about the file; the write is
+      the same code either way. Both have their logs re-read at the end and searched for the
+      token. Outer half.
 * (c) every module under src/ imports, plus main. Probe.
 * (d) every symbol the source imports out of aiogram (and out of the other third-party packages)
       exists, and so do the methods called on them. Probe.
@@ -74,20 +78,25 @@ THE CHECKS
       and the heartbeat interval job that is separate from it precisely so that a slow reminder
       round cannot stop the mark — and writes the startup heartbeat. Probe.
 * (i) the heartbeat and the probe go round: a fresh mark exits 0, a mark aged past the limit exits
-      non-zero, a missing mark exits non-zero, a mark bearing another process's PID exits non-zero
-      (that is the inherited mark an updater leaves on the volume), and the default path really is
-      the one next to the database. BOTH directions of each, because a probe that is always green
-      gates nothing. Probe.
+      non-zero, a missing mark exits non-zero, and the default path is the fixed one in the
+      container's own filesystem — unmoved by DATABASE_PATH, which is what keeps an inherited mark
+      impossible rather than merely rejected. BOTH directions of each, because a probe that is
+      always green gates nothing. Probe.
 * (j) the settings guard: with no TELEGRAM_BOT_TOKEN the process fails with a message that names the
       field, rather than dying of an AttributeError somewhere deeper. A Bot API server address with
-      no scheme is rejected, and the rejection does not carry the token. Both accepted names for the
-      server resolve to the same value, with the park's convention winning when both are set. And
-      the log redaction really removes a token from text. Probe.
+      no scheme is rejected, and the rejection does not carry the token; an EMPTY one is read as
+      "not set" rather than raising at import, which is what a variable declared and left blank in a
+      stack really produces. Both accepted names for the server resolve to the same value, with the
+      park's convention winning when both are set. And the log redaction removes a token from text
+      while leaving text alone when the "token" is too short to be one. Probe.
 * (k) the two workflows really do run the same lines in the steps that claim to be duplicates of
       each other. This is the only check here about the CI files rather than the image, and it is
       here because the claim is otherwise unenforceable: the PR gate and the publishing gate drift
       silently, and always in the direction of the PR gate testing less. Outer half, reading the
       checkout.
+* (l) the stdlib→loguru bridge really carries a record end to end, redacted: the Dockerfile names
+      the log as the only place a permanently failing getUpdates loop appears, and until this row
+      existed nothing checked the mechanism that puts it there. Probe (and the real image, via (b)).
 
 Three properties matter and are easy to lose, so they are stated where they can be checked:
 
@@ -177,13 +186,25 @@ STARTUP_MARKER = "Starting Health Tracker Bot"
 CLOUD_ENDPOINT_MARKER = "Bot API endpoint: cloud default api.telegram.org"
 LOCAL_ENDPOINT_MARKER = "Bot API endpoint: local server {}".format(LOCAL_API_SERVER)
 # The scheduler's own line, which also proves the startup heartbeat write below it was reached.
-# The path in it is RELATIVE because DATABASE_PATH defaults to `data/health.db` and the scheduler
-# logs the path it was given, not a resolved one. Pinned as the literal string the container really
-# prints; the absolute location is pinned separately, by the `docker cp` row below, which is the one
-# that proves where the file actually landed.
-SCHEDULER_MARKER = "Scheduler started, heartbeat file data/heartbeat"
-# Where that startup mark lands in the image: the relative path above, resolved against WORKDIR /app.
-HEARTBEAT_IN_IMAGE = "/app/data/heartbeat"
+# The path in it is the fixed default from src/heartbeat.py — it does not follow DATABASE_PATH,
+# which is the property the whole inherited-mark defence rests on. Pinned as the literal string the
+# container really prints; that the file is THERE is pinned separately, by the `docker cp` row
+# below.
+SCHEDULER_MARKER = "Scheduler started, heartbeat file /tmp/heartbeat"
+# Where that startup mark lands in the image: the container's own writable layer.
+HEARTBEAT_IN_IMAGE = "/tmp/heartbeat"
+# And where it must NOT land. The data directory is the volume the updater carries from a retired
+# container to its replacement, so a mark here would be read as fresh by a container that had done
+# nothing yet. `docker cp` of this path is required to FAIL.
+HEARTBEAT_NOT_ON_VOLUME = "/app/data/heartbeat"
+# Proof that the stdlib→loguru bridge is installed in the real image, taken from the log of the
+# cloud boot. APScheduler logs "Scheduler started" through the stdlib `logging` module at INFO, and
+# this substring is loguru's source attribution for it — the module that emitted the record. Two
+# things make it a proof rather than a coincidence: without the bridge those records leave through
+# `logging.lastResort`, which is WARNING and above (so an INFO record is dropped entirely) and
+# prints the bare message with no attribution at all; and the app's own "Scheduler started,
+# heartbeat file ..." line, which contains the same words, cannot produce this prefix.
+BRIDGE_MARKER = "apscheduler.schedulers.base:"
 
 # ── the probe ─────────────────────────────────────────────────────────────────────────────────────
 PROBE_MARKER = "health_tracker image probe ok"
@@ -191,15 +212,15 @@ PROBE_ROW_PREFIX = "[in-image] "
 # The number of verdicts the probe is supposed to print. Compared EXACTLY rather than "at least",
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
-# 9 modules + 26 imported symbols + 12 methods called on them + 6 handler registration
+# 9 modules + 27 imported symbols + 12 methods called on them + 6 handler registration
 # + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 8 health probe
-# + 8 settings.
-EXPECTED_PROBE_TARGETS = 93
+# + 9 settings + 2 logging bridge.
+EXPECTED_PROBE_TARGETS = 97
 
-# The total this gate produces when everything runs: 20 of its own (8 contract + 2 workflow parity +
-# 6 cloud boot + 4 local boot) + the probe's rows + the two consistency rows run_probe() adds about
+# The total this gate produces when everything runs: 22 of its own (8 contract + 2 workflow parity +
+# 8 cloud boot + 4 local boot) + the probe's rows + the two consistency rows run_probe() adds about
 # the probe itself.
-EXPECTED_TOTAL_TARGETS = 20 + EXPECTED_PROBE_TARGETS + 2
+EXPECTED_TOTAL_TARGETS = 22 + EXPECTED_PROBE_TARGETS + 2
 
 # ── bounds ────────────────────────────────────────────────────────────────────────────────────────
 # Every docker call is bounded, and the OUTER bound has to exceed the sum of the inner ones or it
@@ -207,11 +228,11 @@ EXPECTED_TOTAL_TARGETS = 20 + EXPECTED_PROBE_TARGETS + 2
 # hit at once:
 #     inspect                                                                       30
 #     probe          remove 30 + run 420                                            450
-#     boot cloud     remove 30 + run 60 + markers 90+30 + cp 30 + token logs 30     270
+#     boot cloud     remove 30 + run 60 + markers 90+30 + 2 x cp 30 + token logs 30 300
 #     boot local     remove 30 + run 60 + markers 90+30 + token logs 30             240
 #     cleanup        3 x remove 30                                                   90
 #                                                                                 -----
-#                                                                       1080 s = 18 minutes
+#                                                                     1110 s = 18.5 minutes
 # (The markers line is BOOT_BUDGET plus one LOGS_TIMEOUT: wait_for_markers checks its deadline
 # after each `docker logs`, so a call started just before the deadline still runs to its own bound.)
 # The step's `timeout-minutes` in BOTH workflows is 25, set against this sum: the margin is there so
@@ -223,12 +244,12 @@ REMOVE_TIMEOUT = 30
 START_TIMEOUT = 60
 LOGS_TIMEOUT = 30
 COPY_TIMEOUT = 30
-# 420, not 300. The probe runs subprocesses of its own and they are bounded too: six runs of
+# 420, not 300. The probe runs subprocesses of its own and they are bounded too: five runs of
 # `python -m src.healthcheck` at HEALTHCHECK_RUN_TIMEOUT (30 s) plus one Settings import at 60 s
-# come to 240 s in the worst case, and the rest of the probe — importing aiogram, building bots,
+# come to 210 s in the worst case, and the rest of the probe — importing aiogram, building bots,
 # migrating sqlite files — has to fit in what is left. At 300 the outer bound could fire FIRST and
 # replace a row-by-row report with a single "`docker run` did not finish"; the outer bound must
-# never pre-empt the report it is bounding. 420 leaves ~180 s over the inner sum.
+# never pre-empt the report it is bounding. 420 leaves ~210 s over the inner sum.
 PROBE_TIMEOUT = 420
 
 # How long a container gets to print its startup markers, and how often the log is re-read while
@@ -237,7 +258,7 @@ PROBE_TIMEOUT = 420
 BOOT_BUDGET = 90
 BOOT_PAUSE = 0.5
 
-# Large enough to hold the probe's ENTIRE report (93 lines) plus a boot log with a traceback in it.
+# Large enough to hold the probe's ENTIRE report (97 lines) plus a boot log with a traceback in it.
 # 4000 was not: it cut the probe transcript mid-report, taking the marker line on its last row with
 # it — so the one row that says how many checks really ran became unreadable in the CI log at exactly
 # the moment somebody would be looking for it.
@@ -328,6 +349,7 @@ SYMBOLS = [
     ("loguru", "logger"),
     ("pydantic", "AliasChoices"),
     ("pydantic", "Field"),
+    ("pydantic", "field_validator"),
     ("pydantic_settings", "BaseSettings"),
     ("pydantic_settings", "SettingsConfigDict"),
 ]
@@ -665,6 +687,28 @@ def check_settings():
         except Exception as error:
             fail_group(target, error)
 
+    target = "an empty server address is read as 'not set' rather than raising at import"
+    # A REGRESSION ROW, and the failure it catches takes the whole container down. `VAR=` in a
+    # compose file, a `${VAR:-}` that expanded to nothing, an empty field in Portainer: all of them
+    # set the variable to an empty STRING, which pydantic-settings does NOT treat as absent
+    # (env_ignore_empty is False by default). It reaches the validator as "", and a validator that
+    # only tolerates None rejects it - a ValidationError raised by `import src.settings`, i.e.
+    # before configure_logging() has run, on every restart, on a deployment whose only fault is a
+    # variable declared and left blank.
+    try:
+        problems = []
+        for spelling in ("", "   "):
+            value = settings_from_env(**{CONVENTION_NAME: spelling}).telegram_api_server
+            if value is not None:
+                problems.append("{!r} became {!r} instead of None".format(spelling, value))
+        if problems:
+            record(target, "; ".join(problems))
+        else:
+            record(target)
+    except Exception as error:
+        record(target, "it raised instead: {}. A blank variable now costs a restart loop that "
+                       "starts before logging is configured".format(describe(error)))
+
     target = "a Bot API server address with no scheme is rejected, and the token is not in the error"
     # THE LEAK THIS CLOSES: aiohttp answers a schemeless URL with NonHttpUrlClientError whose text
     # is the whole request URL, and a Telegram request URL carries the token in its path. aiogram
@@ -707,17 +751,23 @@ def check_settings():
     except Exception as error:
         fail_group(target, error)
 
-    target = "DATABASE_PATH and the heartbeat default agree on one definition"
+    target = "the redaction leaves text alone when the token is too short to be one"
+    # TELEGRAM_BOT_TOKEN is a plain `str` with no format check, so TELEGRAM_BOT_TOKEN=test is a
+    # value a stack can really be given - and an unbounded `text.replace(token, ...)` would then
+    # rewrite every occurrence of the word "test" in everything this process logs, starting with
+    # the traceback that says the token is invalid. The bound is the fix; this row is what keeps
+    # it, because nothing else here would notice a log quietly filling with placeholders.
     try:
-        from src.heartbeat import DEFAULT_DATABASE_PATH
-        import src.settings
-        default = src.settings.Settings.model_fields["database_path"].default
-        if default == DEFAULT_DATABASE_PATH:
+        from src.logging_setup import TOKEN_PLACEHOLDER, redact
+        text = "TokenValidationError while running the connection test against the server"
+        scrubbed = redact(text, "test")
+        if scrubbed == text:
             record(target)
         else:
-            record(target, "Settings defaults to {!r} while the probe would look next to {!r}, so "
-                           "the health probe would grade a file nothing writes".format(
-                               default, DEFAULT_DATABASE_PATH))
+            record(target, "redact() rewrote unrelated text into {!r}: with a short token every "
+                           "line that happens to contain it is corrupted, and the first casualty "
+                           "is the message explaining that the token is wrong".format(
+                               scrubbed[:200]))
     except Exception as error:
         fail_group(target, error)
 
@@ -903,7 +953,7 @@ def check_scheduler(workdir):
     """
     from apscheduler.triggers.cron import CronTrigger
     from apscheduler.triggers.interval import IntervalTrigger
-    from src.heartbeat import HEARTBEAT_INTERVAL
+    from src.heartbeat import DEFAULT_HEARTBEAT_FILE, HEARTBEAT_INTERVAL
     from src.database import Database
     from src.scheduler import ReminderScheduler, check_reminders, touch_heartbeat
 
@@ -919,6 +969,8 @@ def check_scheduler(workdir):
         state["jobs"] = scheduler.scheduler.get_jobs()
         state["heartbeat"] = scheduler.heartbeat_path
         state["heartbeat_exists"] = os.path.exists(scheduler.heartbeat_path)
+        state["beside_the_database_exists"] = os.path.exists(
+            os.path.join(os.path.dirname(path), "heartbeat"))
         scheduler.stop()
         await db.close()
 
@@ -978,26 +1030,34 @@ def check_scheduler(workdir):
     else:
         record(target)
 
-    target = "the mark is written at startup, next to the database"
-    expected = os.path.join(os.path.dirname(path), "heartbeat")
-    if state.get("heartbeat") != expected:
-        record(target, "the scheduler writes to {!r}, not to {!r}".format(
-            state.get("heartbeat"), expected))
+    target = "the mark is written at startup, at the fixed path and NOT beside the database"
+    # The second half is the load-bearing one. The scheduler is handed a Database and used to take
+    # the mark's location from it; putting it back there would place the mark on the volume the
+    # updater shares between a retired container and its replacement, where the replacement would
+    # read it as its own. So this row asks where the file went, and also that nothing appeared
+    # next to the database it was given.
+    beside_the_database = os.path.join(os.path.dirname(path), "heartbeat")
+    if state.get("heartbeat") != DEFAULT_HEARTBEAT_FILE:
+        record(target, "the scheduler writes to {!r}, not to {!r} - the mark follows the database "
+                       "again, and on the data volume it outlives the container that wrote "
+                       "it".format(state.get("heartbeat"), DEFAULT_HEARTBEAT_FILE))
     elif not state.get("heartbeat_exists"):
         record(target, "start() left no file behind, so the FIRST health probe of a new container "
                        "would read a missing mark and start burning retries")
+    elif state.get("beside_the_database_exists"):
+        record(target, "it also left a mark at {!r}, i.e. on the volume".format(
+            beside_the_database))
     else:
         record(target)
 
 
 # Each `python -m src.healthcheck` run below gets this many seconds. It imports one stdlib-only
-# module, opens one file and reads two integers out of it, so 30 s is already absurdly generous -
-# and the number is not free: six of these runs are what the outer PROBE_TIMEOUT has to sit above.
+# module, opens one file and reads one integer out of it, so 30 s is already absurdly generous -
+# and the number is not free: five of these runs are what the outer PROBE_TIMEOUT has to sit above.
 HEALTHCHECK_RUN_TIMEOUT = 30
-# The PID staged into a mark that is supposed to be REJECTED as inherited. Any value other than
-# src.heartbeat.CONTAINER_MAIN_PID would do; a large one is used so it cannot collide with a real
-# pid in this container by accident and make the row pass for the wrong reason.
-FOREIGN_PID = 424242
+# WORKDIR in the image, and the root of everything the Dockerfile copies in. The data volume is
+# mounted below it, which is why the default mark must be outside it altogether.
+APP_DIR_IN_IMAGE = "/app"
 
 
 def run_health_probe(env_overrides):
@@ -1013,33 +1073,35 @@ def run_health_probe(env_overrides):
 
 
 def check_health_probe(workdir):
-    """(i) The probe goes round in EVERY direction, and the inherited mark is dropped.
+    """(i) The probe goes round in EVERY direction, and the mark cannot be inherited.
 
     A probe only ever exercised on a fresh mark is indistinguishable from `exit 0` - it would gate
     nothing and would report every wedged container healthy forever. So each rejecting branch is
-    staged: an aged mark, no mark, and a mark bearing another process's PID.
+    staged: an aged mark and no mark at all.
 
-    That last one is the case an updater creates every single time it deploys. The mark sits on the
-    data volume, the replacement container is created over that same volume, and the mark the
-    outgoing container wrote seconds ago is therefore on disk before the new one has done anything.
-    Two independent things reject it - main.py deletes the file at startup, and the probe refuses a
-    PID that is not the container's main process - and both are checked here, one directly and one
-    (the deletion) through the order in which main.py does its startup.
-
-    This container's own interpreter is PID 1, exactly as the image's CMD is, which is what lets
-    the REAL writer's output be handed to the REAL probe below without staging anything.
+    THE INHERITED MARK IS CHECKED DIFFERENTLY FROM THE REST, because it is now prevented by
+    construction instead of rejected by a rule. The mark lives at a fixed path in the container's
+    own writable layer, which the daemon creates empty for every container it creates, so a mark
+    written by the container an updater is replacing cannot be at that path to be read. There is
+    no content to inspect and no rule that could be tested by staging one - what can still go
+    wrong is the PATH moving back onto the data volume, which is what the row below watches.
+    (The version this replaced put the writer's PID in the file and required it to be 1. It could
+    not work: PID namespaces are per-container, so the retired container's `python main.py` wrote
+    the same 1 - and it broke healthy containers, because anything that stops the app being PID 1,
+    `init: true` in the stack above all, made the probe fail forever.)
     """
     from src.heartbeat import (
-        CONTAINER_MAIN_PID, HEARTBEAT_MAX_AGE, clear_heartbeat, format_mark, write_heartbeat)
+        DEFAULT_HEARTBEAT_FILE, HEARTBEAT_MAX_AGE, clear_heartbeat, format_mark, heartbeat_file,
+        write_heartbeat)
 
     directory = os.path.join(workdir, "probe")
     os.makedirs(directory, exist_ok=True)
     mark = os.path.join(directory, "heartbeat")
 
-    def stage(path, pid, timestamp):
-        """Write a mark with chosen contents, through the app's own format_mark()."""
+    def stage(path, timestamp):
+        """Write a mark of a chosen age, through the app's own format_mark()."""
         with open(path, "w") as handle:
-            handle.write(format_mark(pid, timestamp))
+            handle.write(format_mark(timestamp))
 
     target = "a fresh mark makes the probe exit 0"
     try:
@@ -1057,7 +1119,7 @@ def check_health_probe(workdir):
     try:
         # Staged through the CONTENT, not through the mtime: the age the probe grades is the
         # timestamp the writer put in the file.
-        stage(mark, CONTAINER_MAIN_PID, time.time() - (HEARTBEAT_MAX_AGE + 30))
+        stage(mark, time.time() - (HEARTBEAT_MAX_AGE + 30))
         status, output = run_health_probe({"HEARTBEAT_FILE": mark})
         if status != 0:
             record(target)
@@ -1067,17 +1129,46 @@ def check_health_probe(workdir):
     except Exception as error:
         fail_group(target, error)
 
-    target = "a mark written by another process makes the probe exit non-zero"
+    target = "the default mark path is fixed, outside {}, and does not follow DATABASE_PATH".format(
+        APP_DIR_IN_IMAGE)
+    # THE ROW THAT GUARDS THE INHERITED-MARK DEFENCE. It is the only one that can, because that
+    # defence is a location and not a rule: the mark is only unforgeable while it sits in the
+    # container's own writable layer, which every new container gets empty. Put it back under the
+    # data directory - the natural "keep the mark with the data" edit - and the updater hands each
+    # replacement container the mark its predecessor wrote seconds earlier, which the probe would
+    # read as fresh and report healthy on a container that has not done anything yet.
+    # So: moving DATABASE_PATH must not move the mark, and the mark must not be under /app at all
+    # (the volume is mounted inside it).
     try:
-        stage(mark, FOREIGN_PID, time.time())
-        status, output = run_health_probe({"HEARTBEAT_FILE": mark})
-        if status != 0:
-            record(target)
+        saved = {name: os.environ.get(name) for name in ("DATABASE_PATH", "HEARTBEAT_FILE")}
+        try:
+            os.environ.pop("HEARTBEAT_FILE", None)
+            os.environ["DATABASE_PATH"] = os.path.join(APP_DIR_IN_IMAGE, "data", "health.db")
+            beside_the_volume = heartbeat_file()
+            os.environ["DATABASE_PATH"] = os.path.join(workdir, "elsewhere", "health.db")
+            somewhere_else = heartbeat_file()
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+        problems = []
+        if beside_the_volume != DEFAULT_HEARTBEAT_FILE or somewhere_else != DEFAULT_HEARTBEAT_FILE:
+            problems.append(
+                "DATABASE_PATH moves the mark: it resolves to {!r} and then to {!r}, so the mark "
+                "follows the database onto the volume the updater shares between the retired "
+                "container and its replacement".format(beside_the_volume, somewhere_else))
+        if not os.path.isabs(DEFAULT_HEARTBEAT_FILE):
+            problems.append("{!r} is relative, so where it lands depends on the working directory "
+                            "of whoever writes it".format(DEFAULT_HEARTBEAT_FILE))
+        if DEFAULT_HEARTBEAT_FILE.startswith(APP_DIR_IN_IMAGE + "/"):
+            problems.append("{!r} is inside {}, which is where the data volume is mounted".format(
+                DEFAULT_HEARTBEAT_FILE, APP_DIR_IN_IMAGE))
+        if problems:
+            record(target, "; ".join(problems))
         else:
-            record(target, "it exited 0 on a mark this process did not write. That is the mark the "
-                           "container being REPLACED leaves on the shared volume, seconds old - so "
-                           "the first probe of a container that came up and wedged would report it "
-                           "healthy, and the updater would keep the broken image")
+            record(target)
     except Exception as error:
         fail_group(target, error)
 
@@ -1092,23 +1183,27 @@ def check_health_probe(workdir):
     except Exception as error:
         fail_group(target, error)
 
-    target = "clear_heartbeat() removes an inherited mark, and tolerates there being none"
+    target = "clear_heartbeat() removes a mark left at the path, and tolerates there being none"
+    # What this still covers now that the default path cannot be inherited: a HEARTBEAT_FILE
+    # override pointed at a volume or a bind mount, which is a supported thing to do and puts the
+    # mark back where the retired container's copy of it survives.
     try:
         inherited = os.path.join(directory, "inherited")
-        stage(inherited, FOREIGN_PID, time.time())
+        stage(inherited, time.time())
         clear_heartbeat(inherited)
         if os.path.exists(inherited):
-            record(target, "the file is still there, so 'no mark' would go on meaning 'the previous "
-                           "container's mark' for as long as a hung startup lasted")
+            record(target, "the file is still there, so with an overridden HEARTBEAT_FILE 'no mark' "
+                           "would go on meaning 'the previous container's mark' for as long as a "
+                           "hung startup lasted")
         else:
-            # Again on a path that is not there: the normal case on a fresh volume, and it must not
-            # raise - it runs before anything else in main().
+            # Again on a path that is not there: the normal case, and it must not raise - it runs
+            # before anything else in main().
             clear_heartbeat(inherited)
             record(target)
     except Exception as error:
         fail_group(target, error)
 
-    target = "main.py clears the inherited mark before anything that can block"
+    target = "main.py clears any mark at the path before anything that can block"
     # A SOURCE-ORDER check, and it is worth being plain about how weak that is: it reads main.py
     # rather than running it, because running main() means polling Telegram. What it establishes is
     # exactly the property that matters and nothing more - that the deletion is not somewhere below
@@ -1142,8 +1237,9 @@ def check_health_probe(workdir):
         init_at = first_line.get("db.init")
         start_at = first_line.get("scheduler.start")
         if clear_at is None:
-            record(target, "main.py never calls clear_heartbeat(), so a mark left by the container "
-                           "this one replaced is what the first probes read")
+            record(target, "main.py never calls clear_heartbeat(), so with HEARTBEAT_FILE pointed "
+                           "at a mounted path the mark left by the container this one replaced is "
+                           "what the first probes read")
         elif init_at is None or start_at is None:
             record(target, "main.py no longer calls db.init() or scheduler.start(), so this ordering "
                            "check has nothing to compare against and proves nothing as written")
@@ -1155,17 +1251,18 @@ def check_health_probe(workdir):
     except Exception as error:
         fail_group(target, error)
 
-    # With no HEARTBEAT_FILE the probe has to find the mark on its own, from DATABASE_PATH. That
-    # resolution is the one production uses - the override exists for this gate - so it is checked
-    # in both directions too: present and readable, then removed.
-    default_dir = os.path.join(workdir, "defaulted")
-    os.makedirs(default_dir, exist_ok=True)
-    default_db = os.path.join(default_dir, "health.db")
-    default_mark = os.path.join(default_dir, "heartbeat")
+    # With no HEARTBEAT_FILE the probe has to find the mark on its own. That resolution is the one
+    # production uses - the override exists for this gate - so it is checked in both directions
+    # too: present and readable, then removed. DATABASE_PATH is pointed at a directory holding no
+    # mark at all throughout, which is what makes these two rows say something the row above does
+    # not: the REAL probe process, not just heartbeat_file(), reads the fixed path rather than
+    # anything derived from the database.
+    default_db = os.path.join(workdir, "defaulted", "health.db")
+    os.makedirs(os.path.dirname(default_db), exist_ok=True)
 
-    target = "with no override the probe finds the mark next to DATABASE_PATH"
+    target = "with no override the probe reads {}".format(DEFAULT_HEARTBEAT_FILE)
     try:
-        write_heartbeat(default_mark)
+        write_heartbeat(DEFAULT_HEARTBEAT_FILE)
         status, output = run_health_probe({"DATABASE_PATH": default_db})
         if status == 0:
             record(target)
@@ -1176,7 +1273,7 @@ def check_health_probe(workdir):
 
     target = "and it is really THAT file the probe reads"
     try:
-        os.remove(default_mark)
+        os.remove(DEFAULT_HEARTBEAT_FILE)
         status, output = run_health_probe({"DATABASE_PATH": default_db})
         if status != 0:
             record(target)
@@ -1185,6 +1282,67 @@ def check_health_probe(workdir):
                            "file - or nothing at all")
     except Exception as error:
         fail_group(target, error)
+
+
+def check_logging_bridge():
+    """(l) The stdlib -> loguru bridge, end to end, with the redaction on the way out.
+
+    aiogram, apscheduler and aiohttp all log through the stdlib `logging` module. Without the
+    bridge their records have no handler at all and leave through `logging.lastResort`: stderr,
+    WARNING and above only, unformatted, past LOG_LEVEL and past the redacting sink. The Dockerfile
+    names the log as the ONLY place a permanently failing getUpdates loop ever appears - the
+    healthcheck deliberately cannot see it - so the bridge carries a load nothing here was checking:
+    the redaction row above calls redact() directly and would stay green with the bridge deleted.
+
+    Runs LAST in this probe, because configure_logging() replaces the process's logging
+    configuration, loguru's sinks and sys.excepthook.
+    """
+    reached = "a record logged through the stdlib logging module reaches the loguru sink"
+    scrubbed_target = "and the token is scrubbed out of it before it reaches stderr"
+    try:
+        import contextlib
+        import io
+        import logging
+        from src.logging_setup import TOKEN_PLACEHOLDER, configure_logging
+
+        token = "123456789:AAtokenLoggedThroughTheStdlibBridge0"
+        buffer = io.StringIO()
+        configure_logging(token, "INFO")
+        # The shape of the real line this exists for: aiogram's own
+        # `loggers.dispatcher.error("Failed to fetch updates - %s: %s", ...)`, at a level
+        # lastResort would drop, with the request URL in it - and a Telegram request URL carries
+        # the token in its path. The %-arguments are passed as arguments on purpose: the bridge
+        # applies them itself, and a bridge that handed loguru the raw template would print the
+        # line without the URL in it at all.
+        with contextlib.redirect_stderr(buffer):
+            logging.getLogger("aiogram.dispatcher").info(
+                "Failed to fetch updates - %s: %s", "TelegramNetworkError",
+                "http://server/bot{}/getUpdates".format(token))
+        written = buffer.getvalue()
+    except Exception as error:
+        fail_group(reached, error)
+        fail_group(scrubbed_target, error)
+        return
+
+    if "Failed to fetch updates" not in written:
+        record(reached, "nothing reached the sink: {!r}. Without the bridge these records go out "
+                        "through logging.lastResort - WARNING and above, so this INFO one is "
+                        "dropped outright, and a failing polling loop leaves no trace "
+                        "anywhere".format(written[:200]))
+    elif "TelegramNetworkError" not in written:
+        record(reached, "the line arrived without its %-arguments applied: {!r}".format(
+            written[:200]))
+    else:
+        record(reached)
+
+    if token in written or token.partition(":")[2] in written:
+        record(scrubbed_target, "the token survived into the sink's output, so a polling failure "
+                                "would print it into a log docker keeps for the life of the "
+                                "container")
+    elif TOKEN_PLACEHOLDER not in written:
+        record(scrubbed_target, "nothing was replaced at all: {!r}".format(written[:200]))
+    else:
+        record(scrubbed_target)
 
 
 def main():
@@ -1199,6 +1357,8 @@ def main():
     check_scheduler(workdir)
     check_health_probe(workdir)
     check_settings()
+    # Last: it reconfigures logging for the whole process.
+    check_logging_bridge()
 
     failed = 0
     for target, reason in REPORT:
@@ -1482,10 +1642,11 @@ def start_boot_container(image, name, extra_env):
 def check_boot_cloud(image, name):
     """(b) The default branch: no Bot API server configured.
 
-    Six rows: the container started, three log lines, the heartbeat file, and the token check. The
-    log rows prove the process got past import, settings, the database and the scheduler; the file
-    row proves the startup heartbeat this image's healthcheck depends on is really written, at the
-    path the probe really looks at, by the real command, with that command's PID in it — none of
+    Eight rows: the container started, four log lines, the heartbeat file, the absence of a mark on
+    the volume path, and the token check. The log rows prove the process got past import, settings,
+    the database and the scheduler, and that a library's stdlib log record really came out through
+    loguru; the file rows prove the startup heartbeat this image's healthcheck depends on is
+    written by the real command, at the path the probe really looks at and at no other — none of
     which the in-image probe can establish, because it never runs the CMD. This is the ONLY
     container whose heartbeat file is read; check_boot_local exercises the other branch of the
     endpoint decision, and the write below it is the same code either way.
@@ -1494,8 +1655,9 @@ def check_boot_cloud(image, name):
     if not started:
         return rows
 
-    logs = wait_for_markers(name, (STARTUP_MARKER, CLOUD_ENDPOINT_MARKER, SCHEDULER_MARKER),
-                            BOOT_BUDGET)
+    logs = wait_for_markers(
+        name, (STARTUP_MARKER, CLOUD_ENDPOINT_MARKER, SCHEDULER_MARKER, BRIDGE_MARKER),
+        BOOT_BUDGET)
 
     for marker, what in ((STARTUP_MARKER, "the first line main.py logs"),
                          (CLOUD_ENDPOINT_MARKER,
@@ -1503,7 +1665,13 @@ def check_boot_cloud(image, name):
                           "Bot API server visible instead of silent"),
                          (SCHEDULER_MARKER,
                           "the scheduler line, which also means the startup heartbeat write below "
-                          "it was reached")):
+                          "it was reached"),
+                         (BRIDGE_MARKER,
+                          "an apscheduler record carried through the stdlib→loguru bridge — an "
+                          "INFO one, which `logging.lastResort` would have dropped, so its "
+                          "presence is the bridge working in the real image. That bridge is the "
+                          "only thing that makes a permanently failing getUpdates loop visible "
+                          "anywhere, and this is the one row that watches it end to end")):
         target = "the log carries {!r} ({})".format(marker, what)
         rows.append((target, None) if marker in logs else (target, (
             "it never appeared within {} s. Log:\n{}".format(BOOT_BUDGET, excerpt(logs)))))
@@ -1527,20 +1695,37 @@ def check_boot_cloud(image, name):
                 content = handle.read().strip()
         except OSError as error:
             content = "unreadable: {}".format(error)
-        # The format is defined in src/heartbeat.py (format_mark): the writer's PID, a space, the
-        # unix time. It is parsed by hand here rather than imported, because this half of the gate
-        # deliberately knows the image only from the outside. The PID has to be 1: the image's CMD
-        # is in exec form, so the interpreter IS the container's main process, and that is the
-        # number src/healthcheck.py compares against before it grades the age.
+        # The format is defined in src/heartbeat.py (format_mark): one unix time, and nothing else.
+        # It is parsed by hand here rather than imported, because this half of the gate
+        # deliberately knows the image only from the outside. The lower bound rejects a 0 or a
+        # counter that would parse as an integer while meaning nothing.
         parts = content.split()
-        if (len(parts) == 2 and parts[0] == "1" and parts[1].isdigit()
-                and int(parts[1]) > 1700000000):
+        if len(parts) == 1 and parts[0].isdigit() and int(parts[0]) > 1700000000:
             rows.append((target, None))
         else:
             rows.append((target, (
-                "it holds {!r}, which is not '<pid of the main process> <unix time>'. The probe "
-                "rejects a mark it cannot parse or that names another process, so this container "
-                "would never report healthy".format(content))))
+                "it holds {!r}, which is not a unix time. The probe rejects a mark it cannot "
+                "parse, so this container would never report healthy".format(content))))
+
+    target = "and nothing was written to {}, the path on the data volume".format(
+        HEARTBEAT_NOT_ON_VOLUME)
+    # THE OUTSIDE HALF OF THE INHERITED-MARK DEFENCE. That defence is a location, so this is the
+    # row that guards it in the real image: the data directory is the volume Portainer's updater
+    # carries from a retired container to its replacement, and a mark left there would be handed
+    # to the next container seconds old and read as fresh — reporting healthy a container that has
+    # done nothing yet. `docker cp` of that path must therefore FAIL.
+    on_volume = os.path.join(scratch, "heartbeat-on-volume")
+    status, output = docker(
+        ["cp", "{}:{}".format(name, HEARTBEAT_NOT_ON_VOLUME), on_volume], COPY_TIMEOUT)
+    if status is None:
+        rows.append((target, "the check could not run: {}".format(output)))
+    elif status == 0:
+        rows.append((target, (
+            "a mark exists there too. It is on the volume the updater shares between containers, "
+            "so the first probe of the NEXT container would read it, find it fresh and report "
+            "healthy before that container had ticked once")))
+    else:
+        rows.append((target, None))
     shutil.rmtree(scratch, ignore_errors=True)
 
     rows.append(check_token_absent(name))
@@ -1734,13 +1919,13 @@ def main():
 
     # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
     # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 112/112` — three short of the 115 below, and indistinguishable
+    # so the run would end `smoke ok: 118/118` — three short of the 121 below, and indistinguishable
     # from a good run to anybody not counting — exit 0, and have every printed row saying ok with
     # several claims silently no longer made.
     #
     # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
     # failing check legitimately reports fewer rows than its happy path — run_probe emits 1 instead
-    # of the 95 (93 from the probe plus its 2 consistency rows) a green run produces, when its
+    # of the 99 (97 from the probe plus its 2 consistency rows) a green run produces, when its
     # container never started — so on an already-red run this row would fire too, on top of the real
     # failure, and read as though the GATE were broken. The fault it exists to catch is invisible on
     # a red run and decisive on a green one, which is exactly where it is reported.

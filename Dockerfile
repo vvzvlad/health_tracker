@@ -21,19 +21,26 @@ RUN mkdir -p data
 # stays deployed and dead until a human notices the bot went quiet.
 # It reads the heartbeat written by a job that does nothing else, every 30 s (src/heartbeat.py,
 # src/scheduler.py), so the verdict is about the asyncio loop still turning rather than about a
-# process still existing. The mark carries the writing process's PID and main.py deletes it at
-# startup, which is what stops a mark left on the shared volume by the container being replaced
-# from reporting the new one healthy before it has ticked once.
+# process still existing. The mark is written to /tmp, i.e. into the container's own writable
+# layer, which the daemon creates empty for each container — so a mark left by the container
+# this one replaced cannot be at that path and cannot report the new container healthy before
+# it has ticked once. That property comes from WHERE the file is, not from anything in it; see
+# DEFAULT_HEARTBEAT_FILE in src/heartbeat.py before moving it.
 #
 # WHAT IT PROVES IS NARROWER THAN "the image works", and the difference decides which bad
 # images this rolls back. Green here means: the process is up and its scheduler is dispatching.
-# It says NOTHING about the bot serving anybody. aiogram's `Dispatcher._listen_updates` catches
-# every exception around getUpdates and retries forever, so a permanent failure on the API side
-# — a wrong address, connection refused, 401 on a revoked token, 409 because something else is
-# polling the same bot — leaves the process alive, the scheduler ticking, the mark fresh and
-# this probe green while nobody is served. An image broken THAT way gets published, deployed
-# and reported healthy. What makes it visible is the log, and only because src/logging_setup.py
-# routes aiogram's stdlib logger into loguru instead of leaving it to `logging.lastResort`.
+# It says NOTHING about the bot serving anybody ONCE STARTUP HAS SUCCEEDED. aiogram's
+# `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever, so
+# a failure that arrives after that point — 409 because something else started polling the same
+# bot, a revoked token, a Bot API server that goes away — leaves the process alive, the
+# scheduler ticking, the mark fresh and this probe green while nobody is served. An image broken
+# THAT way gets published, deployed and reported healthy. What makes it visible is the log, and
+# only because src/logging_setup.py routes aiogram's stdlib logger into loguru instead of
+# leaving it to `logging.lastResort`.
+# A failure present AT startup is caught here rather than hidden: `HealthBot.start()` calls
+# set_my_commands before it polls, so a wrong address or a refused connection raises, the
+# process dies, and a container that keeps dying never reaches `healthy` — which is exactly the
+# signal the updater rolls back on.
 #
 # THE TIMINGS ARE LOAD-BEARING, not taste. Portainer's updater waits roughly 120 s for a freshly
 # deployed container to report `healthy` and rolls the image back if it does not, so what these

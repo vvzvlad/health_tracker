@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """Docker HEALTHCHECK probe for health_tracker.
 
-Exit 0 (healthy) while the heartbeat is fresh AND was written by this container's own main
-process; exit 1 (unhealthy) when it is missing, stale, unreadable, or inherited from the
-container this one replaced. The mark is written by a dedicated 30 s job in src/scheduler.py
-that does nothing else, so what this probe grades is the asyncio loop still turning — not
-merely that a process exists. A bot whose event loop has wedged keeps its PID and stops
-answering; that is the failure this makes visible.
+Exit 0 (healthy) while the heartbeat is fresh; exit 1 (unhealthy) when it is missing, stale or
+unreadable. The mark is written by a dedicated 30 s job in src/scheduler.py that does nothing
+else, so what this probe grades is the asyncio loop still turning — not merely that a process
+exists. A bot whose event loop has wedged keeps its PID and stops answering; that is the
+failure this makes visible.
 
-WHAT IT DOES NOT GRADE: whether the bot is serving anybody. aiogram retries getUpdates forever
-around a bare `except Exception`, so a permanent failure on the API side leaves the loop
-turning, this probe green and the bot useless. That class of breakage shows up in the log
-(see src/logging_setup.py), never here.
+THERE IS NOTHING HERE ABOUT WHO WROTE THE MARK, and that is by construction rather than by
+omission. The mark lives in the container's own writable layer (src/heartbeat.py,
+DEFAULT_HEARTBEAT_FILE), which the daemon creates empty for every container — so a mark left by
+the container this one replaced cannot be at that path to begin with. Freshness is therefore
+the whole question. Read the comment on DEFAULT_HEARTBEAT_FILE before moving the mark
+anywhere else: on a shared volume this probe would report `healthy` for the outgoing
+container's work, and no check of the file's CONTENT can fix that.
 
-The PID row is what makes the file mean anything on a fresh container. The mark lives on the
-data volume and the updater recreates the container over that same volume, so a mark written
-seconds ago by the outgoing container is on disk when this one starts — and without the PID
-check the very first probe of a container that came up and wedged would read it and report
-healthy. main.py deletes the mark at startup for the same reason; this is the check that still
-holds if the deletion did not.
+WHAT IT DOES NOT GRADE: whether the bot is serving anybody. Once startup has succeeded, aiogram
+retries getUpdates forever around a bare `except Exception`, so a failure that arrives later — a
+409 because something else started polling the same bot, a revoked token, a Bot API server that
+goes away — leaves the loop turning, this probe green and the bot useless. That class of
+breakage shows up in the log (see src/logging_setup.py), never here. A failure present at
+STARTUP is a different story and is caught: the first `set_my_commands` call raises, the process
+dies, and a container that keeps dying never reports healthy.
 
 Run as `python -m src.healthcheck` (WORKDIR /app in the image), which is exactly what the
 Dockerfile's HEALTHCHECK line does.
@@ -34,37 +37,22 @@ which is precisely the rollback this healthcheck was added to make possible.
 import sys
 import time
 
-from src.heartbeat import (
-    CONTAINER_MAIN_PID,
-    HEARTBEAT_MAX_AGE,
-    heartbeat_file,
-    read_heartbeat,
-)
+from src.heartbeat import HEARTBEAT_MAX_AGE, heartbeat_file, read_heartbeat
 
 
 def main():
     path = heartbeat_file()
     try:
-        pid, written_at = read_heartbeat(path)
+        written_at = read_heartbeat(path)
     except OSError:
         # Missing or unreadable mark. Legitimate for the first seconds of a container's
-        # life, which is what --start-period and --retries in the Dockerfile are for — and
-        # after main.py's startup deletion it is also the honest answer for a container that
-        # has come up and never reached its scheduler.
+        # life, which is what --start-period and --retries in the Dockerfile are for — and on
+        # a fresh writable layer it is also the honest answer for a container that has come up
+        # and never reached its scheduler.
         print(f"heartbeat file {path} missing", file=sys.stderr)
         return 1
     except ValueError as error:
         print(f"heartbeat file {path} is unreadable: {error}", file=sys.stderr)
-        return 1
-    if pid != CONTAINER_MAIN_PID:
-        # An inherited mark: written by a process that is not this container's PID 1, i.e. by
-        # the container this one replaced on the shared volume. Grading it fresh would report
-        # healthy for work another container did.
-        print(
-            f"heartbeat was written by pid {pid}, not by this container's main process "
-            f"(pid {CONTAINER_MAIN_PID}): it is left over from the previous container",
-            file=sys.stderr,
-        )
         return 1
     age = time.time() - written_at
     if age > HEARTBEAT_MAX_AGE:

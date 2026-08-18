@@ -68,12 +68,11 @@ class ReminderScheduler:
     def __init__(self, db: Database, bot: HealthBot):
         self.db = db
         self.bot = bot
-        # Next to the database, i.e. on the volume. `db.db_path` is the value main.py built
-        # this Database from — settings.database_path — and taking it from the object
-        # instead of importing settings here keeps the mark provably beside the file the
-        # application really opened. Database.__init__ has already created that directory,
-        # so the first write below cannot fail for want of one.
-        self.heartbeat_path = heartbeat_file(db.db_path)
+        # A fixed path in the container's own writable layer, NOT next to the database and not
+        # derived from it — src/heartbeat.py explains at length why the data volume is the one
+        # place this must never be. Nothing about the Database is consulted here, which is what
+        # makes that independence hold even if DATABASE_PATH moves.
+        self.heartbeat_path = heartbeat_file()
         self.scheduler = AsyncIOScheduler()
 
     def start(self):
@@ -113,8 +112,8 @@ class ReminderScheduler:
         # (30 s) after the scheduler starts — so without this write the first several probes
         # would read a missing file. They would not cost the container anything (failures
         # inside the start period do not count towards --retries), but they would delay
-        # `healthy` by 30 s inside a ~120 s updater window. This write makes the mark exist,
-        # with THIS process's PID in it, from the moment the loop is up.
+        # `healthy` by 30 s inside a ~120 s updater window. This write makes the mark exist
+        # from the moment the loop is up.
         write_heartbeat(self.heartbeat_path, logger)
         logger.info("Scheduler started, heartbeat file {}", self.heartbeat_path)
 

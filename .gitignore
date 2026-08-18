@@ -18,5 +18,8 @@ venv.bak/
 .kilocode/mcp.json
 data/medications.db
 test_medications.db
-# The liveness mark the scheduler writes next to the database; runtime state, not source.
+# The liveness mark. It defaults to /tmp/heartbeat and so normally never lands here at all;
+# this line is for a local run with HEARTBEAT_FILE pointed at the data directory. Runtime
+# state, not source.
 data/heartbeat
+data/heartbeat.new

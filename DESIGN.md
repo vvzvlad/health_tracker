@@ -84,14 +84,22 @@ CREATE INDEX idx_metrics_user   ON metrics(user_id);
 
 ```
 health_tracker/
-├── main.py                  # точка входа: init DB, запуск bot + scheduler
+├── main.py                  # точка входа: логирование, init DB, запуск bot + scheduler
 ├── .env                     # TELEGRAM_BOT_TOKEN, DATABASE_PATH, ...
 ├── requirements.txt
+├── Dockerfile               # образ + HEALTHCHECK (см. «Liveness» ниже)
+├── ci/
+│   └── smoke.py             # smoke-гейт: гоняет собранный образ между build и push
+├── .gitea/workflows/        # PR-гейт (tests.yml) и сборка с публикацией
 ├── src/
 │   ├── settings.py          # pydantic-settings конфиг
 │   ├── database.py          # все SQL-операции (aiosqlite)
 │   ├── bot.py               # aiogram: хэндлеры команд и callback
-│   └── scheduler.py         # APScheduler: ежедневные напоминания
+│   ├── scheduler.py         # APScheduler: напоминания + heartbeat-job
+│   ├── heartbeat.py         # контракт отметки живости (только stdlib)
+│   ├── healthcheck.py       # то, что запускает HEALTHCHECK: python -m src.healthcheck
+│   ├── logging_setup.py     # единый sink loguru, мост stdlib→loguru, вычистка токена
+│   └── utils.py             # парсер часового пояса
 └── data/
     └── health.db
 ```
@@ -135,10 +143,36 @@ last_reminded_date TEXT  -- YYYY-MM-DD в часовом поясе пользо
 ### `settings.py`
 ```python
 TELEGRAM_BOT_TOKEN: str
+TELEGRAM_BOT_API_SERVER: str | None = None   # локальный Bot API server; пустое значение = не задан
 DATABASE_PATH: str = "data/health.db"
 DEFAULT_TIMEZONE: str = "+03:00"
 LOG_LEVEL: str = "INFO"
+HEARTBEAT_FILE: str = "/tmp/heartbeat"       # читается напрямую из окружения, мимо Settings
 ```
+
+### Liveness: `heartbeat.py` + `healthcheck.py`
+
+В образе объявлен `HEALTHCHECK`, который каждые 30 с запускает `python -m src.healthcheck`.
+Отдельная 30-секундная job в APScheduler (`touch_heartbeat`) не делает ничего, кроме записи
+текущего времени в файл-отметку; проба считает контейнер здоровым, пока отметка не старше 90 с
+(три пропущенных тика). Поэтому «healthy» здесь означает «событийный цикл всё ещё крутится», а не
+«процесс всё ещё существует»: зависший asyncio-loop сохраняет PID, но перестаёт писать отметку.
+Это нужно не само по себе — на контейнере стоит `io.portainer.update.enable`, и откат неудачного
+автообновления запускается именно тем, что новый контейнер не дошёл до `healthy`.
+
+Отметка лежит в `/tmp/heartbeat` — в собственном записываемом слое контейнера, а НЕ на томе с
+данными (переопределяется `HEARTBEAT_FILE`). Это принципиально: апдейтер пересоздаёт контейнер
+поверх ТОГО ЖЕ тома, поэтому отметка, лежащая на томе, досталась бы новому контейнеру от старого, и
+первая же проба назвала бы здоровым контейнер, который ещё ничего не сделал. Слой `/tmp` создаётся
+пустым при каждом пересоздании — унаследовать отметку оттуда невозможно по построению, проверять
+нечего.
+
+Чего проба НЕ проверяет: доходит ли бот до пользователей. После успешного старта aiogram
+переспрашивает `getUpdates` вечно, так что поломка на стороне API (409, отозванный токен, пропавший
+Bot API server) оставляет цикл живым, отметку свежей, а пробу зелёной. Такое видно только в логе —
+за что отвечает `logging_setup.py`, заводящий stdlib-логи библиотек в loguru. Поломка, которая есть
+уже НА старте (неверный адрес, отказ в соединении), наоборот, ловится: первый же `set_my_commands`
+падает, процесс умирает и до `healthy` не доходит.
 
 ---
 
