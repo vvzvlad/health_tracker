@@ -106,17 +106,27 @@ class HealthBot:
             #
             # is_local is deliberately left at its default False. It tells aiogram that
             # files named in API responses are readable on this process's own filesystem,
-            # and they are not: telegram-bot-api runs in its own container on internal.lc
-            # (10.31.41.70:8081) while this bot runs on nebula.lc. Nothing here downloads
-            # files today, so the flag only stands to be wrong later.
+            # and they are not: the local Bot API server runs as its own container on a
+            # different host from this bot. Nothing here downloads files today, so the flag
+            # only stands to be wrong later.
             session = AiohttpSession(
                 api=TelegramAPIServer.from_base(settings.telegram_api_server)
             )
             self.bot = Bot(token=settings.telegram_bot_token, session=session)
-            # The address is not a secret; the token is, and never reaches the log in any
-            # form. This line exists so that a failure of this class stops being silent: a
-            # stack that passes TELEGRAM_BOT_API_SERVER and a bot that ignores it produced
-            # exactly the same log until somebody opened a python shell inside the container.
+            # The address is not a secret and is logged on purpose, so that a failure of this
+            # class stops being silent: a stack that passes TELEGRAM_BOT_API_SERVER and a bot
+            # that ignores it produced exactly the same log until somebody opened a python
+            # shell inside the container.
+            #
+            # The TOKEN is a secret, and it is not in this line — but that is a property of
+            # THIS line only and must not be read as "the token never reaches the log". It
+            # can: a Telegram request URL carries the token in its path, so a library that
+            # quotes a request URL in an error quotes the token with it, which is what
+            # aiohttp does for a URL with no scheme. What keeps it out of the log lives
+            # elsewhere and is stated where it is implemented — src/settings.py rejects a
+            # schemeless server address before any request is built, and
+            # src/logging_setup.py scrubs the token out of everything this process writes to
+            # stderr, tracebacks included.
             logger.info("Bot API endpoint: local server {}", settings.telegram_api_server)
         else:
             self.bot = Bot(token=settings.telegram_bot_token)
