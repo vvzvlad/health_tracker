@@ -4,7 +4,8 @@ from loguru import logger
 
 from src.database import Database
 from src.bot import HealthBot
-from src.heartbeat import HEARTBEAT_INTERVAL, heartbeat_file, write_heartbeat
+from src.heartbeat import (
+    HEARTBEAT_INTERVAL, heartbeat_file, write_first_heartbeat, write_heartbeat)
 from src.utils import parse_timezone
 
 # The reminder job's own misfire tolerance, spelled out because APScheduler's default is ONE
@@ -106,16 +107,34 @@ class ReminderScheduler:
             coalesce=True,
         )
         self.scheduler.start()
-        # One mark at startup, and it is not redundant with the job above. With a
-        # --start-period set, docker probes every --start-interval (5 s by default) from the
-        # moment the container starts, while an interval job's FIRST run is one whole interval
-        # (30 s) after the scheduler starts — so without this write the first several probes
-        # would read a missing file. They would not cost the container anything (failures
-        # inside the start period do not count towards --retries), but they would delay
-        # `healthy` by 30 s inside a ~120 s updater window. This write makes the mark exist
-        # from the moment the loop is up.
-        write_heartbeat(self.heartbeat_path, logger)
+        # One mark at startup, and it is not redundant with the job above. Docker probes every 5 s
+        # while --start-period runs and every 30 s afterwards (measured on the production daemon;
+        # the HEALTHCHECK comment in the Dockerfile has the figures), while an interval job's FIRST
+        # run is one whole interval — 30 s — after the scheduler starts, i.e. ~32 s into the
+        # container's life. That is past every start-period probe, so without this write the first
+        # passing probe would be the 60 s one and `healthy` would arrive at ~60 s instead of ~5 s.
+        # Half the updater's ~120 s window, bought by one open() and one write().
+        #
+        # THIS ONE RAISES, unlike the periodic writes the job above does, and the asymmetry is
+        # deliberate: see write_first_heartbeat(). A mark that never appears at all is a working
+        # bot that the updater rolls back on every deploy, which is the direction of wrongness
+        # this file calls worse than having no probe. main.py turns the exception into a last log
+        # line and a stopped container.
+        #
+        # WHAT THE MARK MEANS BY THE TIME IT IS WRITTEN: main.py has already reached the Bot API
+        # once and been accepted (HealthBot.contact_api), so `healthy` is a statement about a bot
+        # that can talk to its server and whose loop is turning — not about a process existing.
+        write_first_heartbeat(self.heartbeat_path)
         logger.info("Scheduler started, heartbeat file {}", self.heartbeat_path)
 
     def stop(self):
-        self.scheduler.shutdown(wait=False)
+        """Tolerates never having been started.
+
+        main.py's `finally` covers the paths where the first Bot API call failed, or where the
+        startup heartbeat could not be written, i.e. before or during start() — and APScheduler's
+        shutdown() raises SchedulerNotRunningError on a scheduler that is not running. Letting that
+        out of a `finally` would replace the real failure with a confusing one raised while
+        cleaning up after it.
+        """
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)

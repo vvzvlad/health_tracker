@@ -50,16 +50,25 @@ THE CHECKS
 * (a) the image's declared contract: CMD, WORKDIR, and the HEALTHCHECK with its exact timings. The
       timings are the mechanism by which a bad automatic update rolls itself back, so they are pinned
       to the second rather than merely checked for existence. Outer half.
-* (b) the real CMD reaches its first lines of log, in BOTH branches of the endpoint decision: once
-      with no Bot API server configured and once with TELEGRAM_BOT_API_SERVER set. The startup
-      heartbeat is checked in ONE of those two containers — the cloud one, whose file is pulled out
-      with `docker cp` and read, and which is also asked to prove that NOTHING was written to the
-      data-volume path the mark must never occupy. That container's log is also where the
-      stdlib→loguru bridge is proved in the real image: an apscheduler record, INFO, in loguru's
-      format, which cannot appear at all if the bridge is gone. The local-server container is
-      started for the other branch of the log line and is not asked about the file; the write is
-      the same code either way. Both have their logs re-read at the end and searched for the
-      token. Outer half.
+* (b) two real boots, and they are each other's opposite direction. The mark no longer exists until
+      the first Bot API request has SUCCEEDED (main.py calls HealthBot.contact_api before
+      scheduler.start), so a single container can no longer answer both questions.
+        - the CLOUD boot runs the image's own CMD with no Bot API server configured and, like
+          everything here, with `--network none`. It reaches its first log lines, cannot reach
+          api.telegram.org, dies — and must leave NO mark behind. That is the negative half of the
+          new property, in the real image: no mark before the API answers.
+        - the SERVED boot is the positive half and the only container here whose Bot API answers.
+          It carries a stub server on 127.0.0.1 (loopback exists under `--network none`; verified)
+          and is pointed at it with TELEGRAM_BOT_API_SERVER, so it exercises that branch of the
+          endpoint decision AND gets far enough to write the mark, which is then pulled out with
+          `docker cp` and read. It is also asked to prove that nothing was written to the
+          data-volume path the mark must never occupy, and its log is where the stdlib→loguru
+          bridge is proved in the real image: an apscheduler record, INFO, in loguru's format,
+          which cannot appear at all if the bridge is gone. It is the ONE container here that does
+          not run the image's own CMD — it runs a wrapper that starts the stub and then executes
+          the same main.py through runpy; the CMD itself is pinned by (a) and exercised by the
+          cloud boot.
+      Both have their logs re-read at the end and searched for the token. Outer half.
 * (c) every module under src/ imports, plus main. Probe.
 * (d) every symbol the source imports out of aiogram (and out of the other third-party packages)
       exists, and so do the methods called on them. Probe.
@@ -79,16 +88,21 @@ THE CHECKS
       round cannot stop the mark — and writes the startup heartbeat. Probe.
 * (i) the heartbeat and the probe go round: a fresh mark exits 0, a mark aged past the limit exits
       non-zero, a missing mark exits non-zero, and the default path is the fixed one in the
-      container's own filesystem — unmoved by DATABASE_PATH, which is what keeps an inherited mark
-      impossible rather than merely rejected. BOTH directions of each, because a probe that is
-      always green gates nothing. Probe.
+      container's own filesystem — unmoved by DATABASE_PATH, which is what keeps a RECREATED
+      container from inheriting a mark. clear_heartbeat() is what keeps a RESTARTED one from
+      inheriting its own previous run's, and it has a row too, as does the order in main.py that
+      puts it and the first Bot API call ahead of everything that writes or blocks. The startup
+      write is also checked to be LOUD where the periodic one is silent. BOTH directions of each,
+      because a probe that is always green gates nothing. Probe.
 * (j) the settings guard: with no TELEGRAM_BOT_TOKEN the process fails with a message that names the
       field, rather than dying of an AttributeError somewhere deeper. A Bot API server address with
       no scheme is rejected, and the rejection does not carry the token; an EMPTY one is read as
       "not set" rather than raising at import, which is what a variable declared and left blank in a
-      stack really produces. Both accepted names for the server resolve to the same value, with the
-      park's convention winning when both are set. And the log redaction removes a token from text
-      while leaving text alone when the "token" is too short to be one. Probe.
+      stack really produces. LOG_LEVEL gets the same treatment for the same reason — a lowercase or
+      blank value must not raise inside configure_logging(), which runs before there is a sink or an
+      excepthook to report it through. Both accepted names for the server resolve to the same value,
+      with the park's convention winning when both are set. And the log redaction removes a token
+      from text while leaving text alone when the "token" is too short to be one. Probe.
 * (k) the two workflows really do run the same lines in the steps that claim to be duplicates of
       each other. This is the only check here about the CI files rather than the image, and it is
       here because the claim is otherwise unenforceable: the PR gate and the publishing gate drift
@@ -135,9 +149,9 @@ NAME_ENV = "SMOKE_NAME"
 
 PROBE_SUFFIX = "-probe"
 BOOT_CLOUD_SUFFIX = "-boot-cloud"
-BOOT_LOCAL_SUFFIX = "-boot-local"
+BOOT_SERVED_SUFFIX = "-boot-served"
 # Kept in step with the cleanup step in both workflows, which removes the same suffixes.
-ALL_SUFFIXES = (PROBE_SUFFIX, BOOT_CLOUD_SUFFIX, BOOT_LOCAL_SUFFIX)
+ALL_SUFFIXES = (PROBE_SUFFIX, BOOT_CLOUD_SUFFIX, BOOT_SERVED_SUFFIX)
 
 # ── what the image is supposed to declare ─────────────────────────────────────────────────────────
 APP_DIR = "/app"
@@ -145,14 +159,15 @@ EXPECTED_CMD = ["python", "main.py"]
 # `docker inspect` reports a shell-form HEALTHCHECK as CMD-SHELL plus the literal command line.
 EXPECTED_HEALTHCHECK_TEST = ["CMD-SHELL", "python -m src.healthcheck || exit 1"]
 # Nanoseconds, which is how the daemon reports durations. These four numbers are not style, and the
-# Dockerfile explains them in full: Portainer's updater rolls an image back if `healthy` has not
-# arrived in about 120 s. A healthy container reaches it in seconds, because docker probes every
-# --start-interval (5 s by default) during the start period and the first success is enough; a
-# container that never becomes healthy is graded `unhealthy` only at --start-period +
-# --retries x --interval = 120 s, since failures inside the start period do not count towards the
-# retries. A longer interval — the natural "it is a stable service" edit — pushes both of those past
-# the window and makes every automatic update roll itself back while looking like a failing image.
-# Pinned here so that edit cannot land without this gate saying so.
+# Dockerfile explains them in full, against a probe schedule measured on the production daemon:
+# Portainer's updater rolls an image back if `healthy` has not arrived in about 120 s. A healthy
+# container reaches it at its FIRST successful probe, about 5 s in — docker probes every
+# --start-interval (5 s, the default since Docker 25, applied whether or not the image declares it)
+# while --start-period runs, and every --interval afterwards. A container that never becomes
+# healthy is graded `unhealthy` only at --start-period + --retries x --interval = 120 s. A longer
+# interval — the natural "it is a stable service" edit — pushes both of those past the window and
+# makes every automatic update roll itself back while looking like a failing image. Pinned here so
+# that edit cannot land without this gate saying so.
 EXPECTED_HEALTHCHECK_INTERVAL = 30 * 1000000000
 EXPECTED_HEALTHCHECK_TIMEOUT = 5 * 1000000000
 EXPECTED_HEALTHCHECK_START_PERIOD = 30 * 1000000000
@@ -174,22 +189,25 @@ DUPLICATED_STEPS = ("Compute image tags", "Smoke-test the built image")
 # and belongs to no bot. Every container below runs with `--network none`, so it never leaves the
 # daemon even if it wanted to.
 FAKE_TOKEN = "123456789:AAFakeTokenUsedOnlyByTheSmokeGate0000"
-# The address handed to the local-server boot. A PLACEHOLDER, deliberately, and not production's
-# real internal address: this repository is public on two forges and the checks below work exactly
-# as well against a name that resolves nowhere. Nothing connects to it in any case —
-# `--network none` — and what is being checked is that the log line NAMES the endpoint it was given,
-# whatever that endpoint is. The scheme is not decoration: src/settings.py rejects a bare host:port,
-# so an address written without one would fail the boot rather than exercise the branch.
-LOCAL_API_SERVER = "http://bot-api.example.lan:8081"
+# The address handed to the SERVED boot, and it is a real address there rather than a placeholder:
+# a stub Bot API server runs on that port inside that same container. Loopback is available under
+# `--network none` (the namespace has an `lo` interface and it is UP — verified on nebula, Docker
+# 27.1.1, the version production runs),
+# so this reaches the stub and nothing else, which keeps the "no container here can reach Telegram"
+# guarantee exactly as strong as it was. The scheme is not decoration: src/settings.py rejects a
+# bare host:port, so an address written without one would fail the boot rather than exercise the
+# branch.
+SERVED_API_SERVER = "http://127.0.0.1:8081"
 
 STARTUP_MARKER = "Starting Health Tracker Bot"
 CLOUD_ENDPOINT_MARKER = "Bot API endpoint: cloud default api.telegram.org"
-LOCAL_ENDPOINT_MARKER = "Bot API endpoint: local server {}".format(LOCAL_API_SERVER)
-# The scheduler's own line, which also proves the startup heartbeat write below it was reached.
-# The path in it is the fixed default from src/heartbeat.py — it does not follow DATABASE_PATH,
-# which is the property the whole inherited-mark defence rests on. Pinned as the literal string the
-# container really prints; that the file is THERE is pinned separately, by the `docker cp` row
-# below.
+SERVED_ENDPOINT_MARKER = "Bot API endpoint: local server {}".format(SERVED_API_SERVER)
+# The scheduler's own line, which also proves the startup heartbeat write below it was reached —
+# and, since the scheduler now starts only after HealthBot.contact_api() has returned, that the
+# first Bot API request was answered. The path in it is the fixed default from src/heartbeat.py: it
+# does not follow DATABASE_PATH, which is what keeps a recreated container from inheriting a mark.
+# Pinned as the literal string the container really prints; that the file is THERE is pinned
+# separately, by the `docker cp` row below.
 SCHEDULER_MARKER = "Scheduler started, heartbeat file /tmp/heartbeat"
 # Where that startup mark lands in the image: the container's own writable layer.
 HEARTBEAT_IN_IMAGE = "/tmp/heartbeat"
@@ -198,13 +216,22 @@ HEARTBEAT_IN_IMAGE = "/tmp/heartbeat"
 # nothing yet. `docker cp` of this path is required to FAIL.
 HEARTBEAT_NOT_ON_VOLUME = "/app/data/heartbeat"
 # Proof that the stdlib→loguru bridge is installed in the real image, taken from the log of the
-# cloud boot. APScheduler logs "Scheduler started" through the stdlib `logging` module at INFO, and
+# served boot. APScheduler logs "Scheduler started" through the stdlib `logging` module at INFO, and
 # this substring is loguru's source attribution for it — the module that emitted the record. Two
-# things make it a proof rather than a coincidence: without the bridge those records leave through
-# `logging.lastResort`, which is WARNING and above (so an INFO record is dropped entirely) and
-# prints the bare message with no attribution at all; and the app's own "Scheduler started,
-# heartbeat file ..." line, which contains the same words, cannot produce this prefix.
+# things make it a proof rather than a coincidence. Without the bridge that record has no handler
+# anywhere on its chain, and at INFO it is not even built: `Logger.isEnabledFor` compares against
+# the effective level, which with nothing configured is the root logger's default of WARNING, so
+# the record is dropped by the logger itself and never reaches `logging.lastResort` at all.
+# (lastResort is the fallback for a record that IS emitted with no handler — WARNING and above,
+# bare message, no attribution — so it could not produce this prefix either.) And the app's own
+# "Scheduler started, heartbeat file ..." line, which contains the same words, cannot produce it.
 BRIDGE_MARKER = "apscheduler.schedulers.base:"
+
+# ── the stub Bot API server, and where it goes in the image ───────────────────────────────────────
+# Copied into the SERVED container with `docker cp` before it is started, and run INSTEAD of the
+# image's CMD. Under /app because that is WORKDIR, so `runpy` and the app's own imports resolve
+# from the same directory the real CMD runs in. The name is deliberately not one of the app's.
+SERVED_WRAPPER_PATH = "/app/smoke_served_boot.py"
 
 # ── the probe ─────────────────────────────────────────────────────────────────────────────────────
 PROBE_MARKER = "health_tracker image probe ok"
@@ -213,37 +240,43 @@ PROBE_ROW_PREFIX = "[in-image] "
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
 # 9 modules + 27 imported symbols + 12 methods called on them + 6 handler registration
-# + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 8 health probe
-# + 9 settings + 2 logging bridge.
-EXPECTED_PROBE_TARGETS = 97
+# + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 10 health probe
+# + 11 settings + 2 logging bridge.
+EXPECTED_PROBE_TARGETS = 101
 
-# The total this gate produces when everything runs: 22 of its own (8 contract + 2 workflow parity +
-# 8 cloud boot + 4 local boot) + the probe's rows + the two consistency rows run_probe() adds about
+# The total this gate produces when everything runs: 24 of its own (8 contract + 2 workflow parity +
+# 6 cloud boot + 8 served boot) + the probe's rows + the two consistency rows run_probe() adds about
 # the probe itself.
-EXPECTED_TOTAL_TARGETS = 22 + EXPECTED_PROBE_TARGETS + 2
+EXPECTED_TOTAL_TARGETS = 24 + EXPECTED_PROBE_TARGETS + 2
 
 # ── bounds ────────────────────────────────────────────────────────────────────────────────────────
 # Every docker call is bounded, and the OUTER bound has to exceed the sum of the inner ones or it
 # fires first and replaces a per-row diagnosis with "did not finish". The worst case, all of them
 # hit at once:
-#     inspect                                                                       30
-#     probe          remove 30 + run 420                                            450
-#     boot cloud     remove 30 + run 60 + markers 90+30 + 2 x cp 30 + token logs 30 300
-#     boot local     remove 30 + run 60 + markers 90+30 + token logs 30             240
-#     cleanup        3 x remove 30                                                   90
-#                                                                                 -----
-#                                                                     1110 s = 18.5 minutes
+#     inspect                                                                        30
+#     probe          remove 30 + run 420                                             450
+#     boot cloud     remove 30 + run 60 + markers 90+30 + wait 90 + cp 30 + logs 30   360
+#     boot served    remove 30 + create 60 + cp-in 30 + start 60 + markers 90+30
+#                    + 2 x cp 30 + logs 30                                           390
+#     cleanup        3 x remove 30                                                    90
+#                                                                                  -----
+#                                                                       1320 s = 22 minutes
 # (The markers line is BOOT_BUDGET plus one LOGS_TIMEOUT: wait_for_markers checks its deadline
 # after each `docker logs`, so a call started just before the deadline still runs to its own bound.)
-# The step's `timeout-minutes` in BOTH workflows is 25, set against this sum: the margin is there so
+# The step's `timeout-minutes` in BOTH workflows is 30, set against this sum: the margin is there so
 # that a gate which is merely slow fails with ITS OWN diagnosis rather than being killed by
 # act_runner, which would skip the cleanup in the `finally` below. Adding a bounded call here
-# without revisiting both workflows is how a gate starts being killed instead of reporting.
+# without revisiting both workflows is how a gate starts being killed instead of reporting — the
+# served boot below was added that way and both workflows went from 25 to 30 with it.
 INSPECT_TIMEOUT = 30
 REMOVE_TIMEOUT = 30
 START_TIMEOUT = 60
 LOGS_TIMEOUT = 30
 COPY_TIMEOUT = 30
+# `docker wait` blocks until the container exits, so this is the only bound standing between a
+# container that never dies and a hung gate. 90 is set against the longest a startup that is going
+# to fail can legitimately take: aiogram's per-request timeout is 60 s and there is one request.
+WAIT_TIMEOUT = 90
 # 420, not 300. The probe runs subprocesses of its own and they are bounded too: five runs of
 # `python -m src.healthcheck` at HEALTHCHECK_RUN_TIMEOUT (30 s) plus one Settings import at 60 s
 # come to 210 s in the worst case, and the rest of the probe — importing aiogram, building bots,
@@ -258,7 +291,7 @@ PROBE_TIMEOUT = 420
 BOOT_BUDGET = 90
 BOOT_PAUSE = 0.5
 
-# Large enough to hold the probe's ENTIRE report (97 lines) plus a boot log with a traceback in it.
+# Large enough to hold the probe's ENTIRE report (101 lines) plus a boot log with a traceback in it.
 # 4000 was not: it cut the probe transcript mid-report, taking the marker line on its last row with
 # it — so the one row that says how many checks really ran became unreadable in the CI log at exactly
 # the moment somebody would be looking for it.
@@ -646,6 +679,20 @@ def settings_from_env(**overrides):
                 os.environ[name] = value
 
 
+def settings_with_log_level(value):
+    """Build a fresh Settings with LOG_LEVEL forced to `value` and restored afterwards."""
+    import src.settings
+    saved = os.environ.get("LOG_LEVEL")
+    try:
+        os.environ["LOG_LEVEL"] = value
+        return src.settings.Settings()
+    finally:
+        if saved is None:
+            os.environ.pop("LOG_LEVEL", None)
+        else:
+            os.environ["LOG_LEVEL"] = saved
+
+
 def check_settings():
     """(j) The guard, and the two accepted names for one setting."""
     target = "a missing TELEGRAM_BOT_TOKEN fails the process with a message naming the field"
@@ -708,6 +755,60 @@ def check_settings():
     except Exception as error:
         record(target, "it raised instead: {}. A blank variable now costs a restart loop that "
                        "starts before logging is configured".format(describe(error)))
+
+    target = "LOG_LEVEL is normalised, so a lowercase or blank value cannot kill the process"
+    # A REGRESSION ROW OF THE SAME SHAPE AS THE ONE ABOVE, and it catches the same class of
+    # failure. loguru's level names are upper case and its lookup is exact: on the pinned loguru
+    # 0.7.2 both `logger.add(sink, level="info")` and `logger.level("info")` raise ValueError.
+    # log_level used to be a plain str with no normalisation, so `LOG_LEVEL=info` in a stack - which
+    # is how most people write it - raised inside configure_logging(), i.e. before the sink and the
+    # excepthook that function installs existed: an unformatted crash, on every restart, forever.
+    # A blank value is the compose spelling of "not set" and must fall back to the default.
+    # Each accepted value is put through `logger.level()` as well, because "it normalised to
+    # something" is not the property that matters - "it normalised to something loguru accepts" is.
+    try:
+        from loguru import logger as loguru_logger
+        problems = []
+        for spelling, expected in (("info", "INFO"), ("  debug  ", "DEBUG"), ("", "INFO"),
+                                   ("   ", "INFO")):
+            value = settings_with_log_level(spelling).log_level
+            if value != expected:
+                problems.append("{!r} became {!r}, expected {!r}".format(spelling, value, expected))
+                continue
+            try:
+                loguru_logger.level(value)
+            except Exception as error:
+                problems.append("{!r} normalised to {!r}, which loguru still rejects: {}".format(
+                    spelling, value, describe(error)))
+        if problems:
+            record(target, "; ".join(problems))
+        else:
+            record(target)
+    except Exception as error:
+        record(target, "it raised instead: {}. A LOG_LEVEL written in the ordinary lower case now "
+                       "costs a restart loop that starts before logging exists".format(
+                           describe(error)))
+
+    target = "an unknown LOG_LEVEL is rejected with a message that names the field"
+    try:
+        rejected = False
+        message = ""
+        try:
+            settings_with_log_level("verbose")
+        except Exception as error:
+            rejected = True
+            message = str(error)
+        if not rejected:
+            record(target, "it was accepted, so the ValueError arrives from inside "
+                           "configure_logging() instead - before there is a sink or an excepthook "
+                           "to render it, i.e. as an unformatted crash in a restart loop")
+        elif "log_level" not in message.lower():
+            record(target, "it is rejected, but the message never names the field: {}".format(
+                message.strip()[:400]))
+        else:
+            record(target)
+    except Exception as error:
+        fail_group(target, error)
 
     target = "a Bot API server address with no scheme is rejected, and the token is not in the error"
     # THE LEAK THIS CLOSES: aiohttp answers a schemeless URL with NonHttpUrlClientError whose text
@@ -1060,6 +1161,38 @@ HEALTHCHECK_RUN_TIMEOUT = 30
 APP_DIR_IN_IMAGE = "/app"
 
 
+def main_call_lines():
+    """Map every call in main.py to the line it FIRST appears on, keyed by dotted name.
+
+    Over the AST and not over the text: the first version of the ordering check below searched the
+    source with str.find() and was fooled by main.py's own COMMENT, which names db.init() several
+    lines above the call it is describing. Call nodes cannot be spelled in a comment.
+
+    Dotted, so that `bot.start()` is not mistaken for `scheduler.start()` - the two differ by the
+    receiver alone and the whole point of the checks that use this is which side of the other each
+    one is on.
+    """
+    import main as main_module
+
+    def call_name(node):
+        func = node.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            return "{}.{}".format(func.value.id, func.attr)
+        return None
+
+    with open(main_module.__file__) as handle:
+        tree = ast.parse(handle.read())
+    first_line = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = call_name(node)
+            if name is not None and name not in first_line:
+                first_line[name] = node.lineno
+    return first_line
+
+
 def run_health_probe(env_overrides):
     """Run the real `python -m src.healthcheck`, the same command line the Dockerfile uses."""
     env = dict(os.environ)
@@ -1079,20 +1212,26 @@ def check_health_probe(workdir):
     nothing and would report every wedged container healthy forever. So each rejecting branch is
     staged: an aged mark and no mark at all.
 
-    THE INHERITED MARK IS CHECKED DIFFERENTLY FROM THE REST, because it is now prevented by
-    construction instead of rejected by a rule. The mark lives at a fixed path in the container's
-    own writable layer, which the daemon creates empty for every container it creates, so a mark
-    written by the container an updater is replacing cannot be at that path to be read. There is
-    no content to inspect and no rule that could be tested by staging one - what can still go
-    wrong is the PATH moving back onto the data volume, which is what the row below watches.
+    THE INHERITED MARK IS CHECKED DIFFERENTLY FROM THE REST, because it is defended by two
+    mechanisms rather than by one rule, and they cover different events.
+      * A container that is RECREATED - which is what an updater does - gets a new writable layer,
+        so the mark the retired container wrote cannot be at the path to be read. That is a
+        property of the LOCATION, with no content to inspect and no rule that staging a mark could
+        test; what can still go wrong is the PATH moving back onto the data volume, and that is
+        what the "default mark path is fixed" row below watches.
+      * A container that is RESTARTED keeps its writable layer, so its own previous run's mark IS
+        there, at most one heartbeat interval old, and would be read as fresh by the first probe
+        of the new run. Nothing about the location helps; clear_heartbeat() in main.py is the
+        whole defence, and it has a row of its own below, plus a source-order row for the position
+        it is called from.
     (The version this replaced put the writer's PID in the file and required it to be 1. It could
     not work: PID namespaces are per-container, so the retired container's `python main.py` wrote
     the same 1 - and it broke healthy containers, because anything that stops the app being PID 1,
     `init: true` in the stack above all, made the probe fail forever.)
     """
     from src.heartbeat import (
-        DEFAULT_HEARTBEAT_FILE, HEARTBEAT_MAX_AGE, clear_heartbeat, format_mark, heartbeat_file,
-        write_heartbeat)
+        DEFAULT_HEARTBEAT_FILE, HEARTBEAT_MAX_AGE, HeartbeatUnwritable, clear_heartbeat,
+        format_mark, heartbeat_file, write_first_heartbeat, write_heartbeat)
 
     directory = os.path.join(workdir, "probe")
     os.makedirs(directory, exist_ok=True)
@@ -1184,9 +1323,14 @@ def check_health_probe(workdir):
         fail_group(target, error)
 
     target = "clear_heartbeat() removes a mark left at the path, and tolerates there being none"
-    # What this still covers now that the default path cannot be inherited: a HEARTBEAT_FILE
-    # override pointed at a volume or a bind mount, which is a supported thing to do and puts the
-    # mark back where the retired container's copy of it survives.
+    # WHAT THIS COVERS, and it is not the exotic case it was once written up as. The writable layer
+    # holding /tmp is new when a container is CREATED and survives when the same container is
+    # RESTARTED - `docker restart`, `restart: unless-stopped` after the process falls over, a host
+    # reboot. On a restart the previous run's mark is still there, at most one heartbeat interval
+    # old, and docker resets the health state to `starting`, so the first probe of the new run
+    # reads it as fresh and reports healthy a process that is still in db.init(). This removal is
+    # the whole defence against that, on the DEFAULT path. It covers a HEARTBEAT_FILE pointed at a
+    # volume or a bind mount into the bargain, where the mark outlives the container itself.
     try:
         inherited = os.path.join(directory, "inherited")
         stage(inherited, time.time())
@@ -1205,41 +1349,19 @@ def check_health_probe(workdir):
 
     target = "main.py clears any mark at the path before anything that can block"
     # A SOURCE-ORDER check, and it is worth being plain about how weak that is: it reads main.py
-    # rather than running it, because running main() means polling Telegram. What it establishes is
-    # exactly the property that matters and nothing more - that the deletion is not somewhere below
-    # db.init(), which is the call that blocks while the outgoing container still holds the
+    # rather than running it, because running main() means talking to Telegram. What it establishes
+    # is exactly the property that matters and nothing more - that the deletion is not somewhere
+    # below db.init(), which is the call that blocks while the outgoing container still holds the
     # database, i.e. the very scenario the deletion exists for.
-    # Over the AST and not over the text: the first version of this check searched the source with
-    # str.find() and was fooled by main.py's own COMMENT, which names db.init() several lines above
-    # the call it is describing. Call nodes cannot be spelled in a comment.
     try:
-        import main as main_module
-
-        def call_name(node):
-            """`clear_heartbeat` / `db.init` / `scheduler.start` - dotted, so bot.start() is not
-            mistaken for scheduler.start()."""
-            func = node.func
-            if isinstance(func, ast.Name):
-                return func.id
-            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                return "{}.{}".format(func.value.id, func.attr)
-            return None
-
-        with open(main_module.__file__) as handle:
-            tree = ast.parse(handle.read())
-        first_line = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                name = call_name(node)
-                if name is not None and name not in first_line:
-                    first_line[name] = node.lineno
+        first_line = main_call_lines()
         clear_at = first_line.get("clear_heartbeat")
         init_at = first_line.get("db.init")
         start_at = first_line.get("scheduler.start")
         if clear_at is None:
-            record(target, "main.py never calls clear_heartbeat(), so with HEARTBEAT_FILE pointed "
-                           "at a mounted path the mark left by the container this one replaced is "
-                           "what the first probes read")
+            record(target, "main.py never calls clear_heartbeat(), so on every restart of this "
+                           "container - a restart policy, `docker restart`, a host reboot - the "
+                           "mark its own previous run left is what the first probes read")
         elif init_at is None or start_at is None:
             record(target, "main.py no longer calls db.init() or scheduler.start(), so this ordering "
                            "check has nothing to compare against and proves nothing as written")
@@ -1247,7 +1369,71 @@ def check_health_probe(workdir):
             record(target)
         else:
             record(target, "it is called after db.init() / scheduler.start(), so a startup that "
-                           "hangs in either still leaves the previous container's mark in place")
+                           "hangs in either still leaves the previous run's mark in place")
+    except Exception as error:
+        fail_group(target, error)
+
+    target = "main.py reaches the Bot API before the scheduler writes the first mark"
+    # THE ORDER THAT DECIDES WHETHER A BROKEN ADDRESS IS CAUGHT AT ALL. scheduler.start() writes the
+    # startup mark, so whatever runs before it is what `healthy` is a statement about. With the
+    # first Bot API request BELOW that line - which is where it lived, inside HealthBot.start() -
+    # an address that merely black-holes traffic produced a container whose mark was on disk a
+    # second or two in - so it was healthy at its first probe, ~5 s in - and which only died 60 s
+    # later on aiogram's per-request timeout: green through the whole ~120 s updater window, so the
+    # broken image was accepted and, under a restart policy, re-accepted forever. Fast failures
+    # (refused, NXDOMAIN, 401) were caught either way; the slow ones, which are the ordinary ones
+    # on a LAN, were not.
+    # Source-order again, and weak in the same way - but the end-to-end proof is outside this
+    # container, in the cloud boot: it runs the real CMD with no network and must leave NO mark.
+    try:
+        first_line = main_call_lines()
+        contact_at = first_line.get("bot.contact_api")
+        start_at = first_line.get("scheduler.start")
+        if contact_at is None:
+            record(target, "main.py never calls bot.contact_api(), so nothing makes a Bot API "
+                           "request before the mark exists and a container pointed at an address "
+                           "that swallows traffic reports healthy for the 60 s until the request "
+                           "times out")
+        elif start_at is None:
+            record(target, "main.py no longer calls scheduler.start(), so this ordering check has "
+                           "nothing to compare against and proves nothing as written")
+        elif contact_at < start_at:
+            record(target)
+        else:
+            record(target, "the first Bot API call is below scheduler.start(), so the mark - and "
+                           "`healthy` with it - exists before the bot has reached its server")
+    except Exception as error:
+        fail_group(target, error)
+
+    target = "the STARTUP mark write is loud where the periodic one is silent"
+    # THE DIRECTION OF FAILURE THAT NOTHING ELSE HERE WOULD NOTICE. A container that cannot write
+    # /tmp at all - a read-only root filesystem with no tmpfs, a volume mounted over /tmp, a full
+    # disk - runs the bot perfectly and never writes a mark, so the probe says `unhealthy` forever
+    # and the updater rolls back a GOOD image on every deploy, with a warning line every 30 s as
+    # the only trace. src/scheduler.py names that direction as worse than having no probe at all.
+    # write_first_heartbeat() therefore raises; write_heartbeat() must NOT, because a periodic
+    # write that fails after the mark has existed once is a stale mark, which is a verdict the
+    # probe is entitled to give. Both halves are checked here, on a path that cannot be written
+    # because its directory does not exist.
+    try:
+        unwritable = os.path.join(directory, "no-such-directory", "heartbeat")
+        loud = None
+        try:
+            write_first_heartbeat(unwritable)
+        except HeartbeatUnwritable as error:
+            loud = str(error)
+        if loud is None:
+            record(target, "write_first_heartbeat() returned quietly on a path it cannot write, so "
+                           "a container whose /tmp is not writable runs on, never reports healthy, "
+                           "and gets its perfectly good image rolled back every time")
+        elif unwritable not in loud:
+            record(target, "it raised, but the message does not name the path {!r}: {}".format(
+                unwritable, loud[:300]))
+        else:
+            # The other half, and it must not raise: the periodic write on the same impossible path
+            # is swallowed. An exception here leaves through the except below, as a failure.
+            write_heartbeat(unwritable)
+            record(target)
     except Exception as error:
         fail_group(target, error)
 
@@ -1288,11 +1474,17 @@ def check_logging_bridge():
     """(l) The stdlib -> loguru bridge, end to end, with the redaction on the way out.
 
     aiogram, apscheduler and aiohttp all log through the stdlib `logging` module. Without the
-    bridge their records have no handler at all and leave through `logging.lastResort`: stderr,
-    WARNING and above only, unformatted, past LOG_LEVEL and past the redacting sink. The Dockerfile
-    names the log as the ONLY place a permanently failing getUpdates loop ever appears - the
-    healthcheck deliberately cannot see it - so the bridge carries a load nothing here was checking:
-    the redaction row above calls redact() directly and would stay green with the bridge deleted.
+    bridge their records have no handler anywhere on their chain, and what happens to them then
+    depends on the level - two mechanisms, not one, and the difference is worth keeping straight
+    because the short version ("lastResort drops them") names the wrong one. Below WARNING the
+    record is never built at all: `Logger.isEnabledFor` compares against the EFFECTIVE level, which
+    with nothing configured is the root logger's default of WARNING, so the logger itself discards
+    it before any handler is consulted. At WARNING and above the record IS emitted, through
+    `logging.lastResort`: stderr, bare message, no attribution, past LOG_LEVEL and past the
+    redacting sink. The Dockerfile names the log as the ONLY place a permanently failing getUpdates
+    loop ever appears - the healthcheck deliberately cannot see it - so the bridge carries a load
+    nothing here was checking: the redaction row above calls redact() directly and would stay green
+    with the bridge deleted.
 
     Runs LAST in this probe, because configure_logging() replaces the process's logging
     configuration, loguru's sinks and sys.excepthook.
@@ -1309,11 +1501,12 @@ def check_logging_bridge():
         buffer = io.StringIO()
         configure_logging(token, "INFO")
         # The shape of the real line this exists for: aiogram's own
-        # `loggers.dispatcher.error("Failed to fetch updates - %s: %s", ...)`, at a level
-        # lastResort would drop, with the request URL in it - and a Telegram request URL carries
-        # the token in its path. The %-arguments are passed as arguments on purpose: the bridge
-        # applies them itself, and a bridge that handed loguru the raw template would print the
-        # line without the URL in it at all.
+        # `loggers.dispatcher.error("Failed to fetch updates - %s: %s", ...)`, logged here at INFO
+        # - a level an unconfigured stdlib logger discards before it builds the record - with the
+        # request URL in it, and a Telegram request URL carries the token in its path. The
+        # %-arguments are passed as arguments on purpose: the bridge applies them itself, and a
+        # bridge that handed loguru the raw template would print the line without the URL in it at
+        # all.
         with contextlib.redirect_stderr(buffer):
             logging.getLogger("aiogram.dispatcher").info(
                 "Failed to fetch updates - %s: %s", "TelegramNetworkError",
@@ -1325,10 +1518,10 @@ def check_logging_bridge():
         return
 
     if "Failed to fetch updates" not in written:
-        record(reached, "nothing reached the sink: {!r}. Without the bridge these records go out "
-                        "through logging.lastResort - WARNING and above, so this INFO one is "
-                        "dropped outright, and a failing polling loop leaves no trace "
-                        "anywhere".format(written[:200]))
+        record(reached, "nothing reached the sink: {!r}. Without the bridge an INFO record like "
+                        "this one is dropped by the logger itself - the effective level with "
+                        "nothing configured is root's WARNING - so a failing polling loop leaves "
+                        "no trace anywhere".format(written[:200]))
     elif "TelegramNetworkError" not in written:
         record(reached, "the line arrived without its %-arguments applied: {!r}".format(
             written[:200]))
@@ -1378,6 +1571,91 @@ def main():
 
 if __name__ == "__main__":
     main()
+'''
+
+
+# ══ THE STUB BOT API SERVER ═══════════════════════════════════════════════════════════════════════
+# Copied into the SERVED container and run instead of the image's CMD. It exists because the mark
+# main.py writes is now gated on the first Bot API request SUCCEEDING, so the only container that
+# can still prove the real startup path reaches the mark at all is one whose Bot API answers.
+#
+# It runs the very same main.py, through runpy: the process entry differs, the code does not. That
+# is the one property this container gives up, and it is bought back elsewhere — the CMD itself is
+# pinned by check_image_contract and exercised end to end by the cloud boot.
+#
+# ASCII-ONLY, like the probe, and for a related reason: it is written to a file on the runner with
+# `encoding="ascii"` below, so a stray em dash fails loudly here rather than turning into mojibake
+# in the container. This file's own comments are outside that constraint.
+SERVED_WRAPPER = r'''
+"""Start a stub Bot API server on loopback, then run the image's main.py against it."""
+
+import http.server
+import json
+import runpy
+import threading
+import time
+
+PORT = 8081
+MAIN = "/app/main.py"
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        """Silence, and this override is not tidiness.
+
+        BaseHTTPRequestHandler logs the REQUEST LINE to stderr, and a Telegram request line is
+        /bot<token>/<method> - so the default would print the token straight into the container
+        log, around loguru's redacting sink, and the gate searches that log for exactly that.
+        """
+
+    def drain(self):
+        """Read the request body off the socket, whichever framing aiohttp used."""
+        length = self.headers.get("Content-Length")
+        if length:
+            self.rfile.read(int(length))
+            return
+        if (self.headers.get("Transfer-Encoding") or "").lower() == "chunked":
+            while True:
+                size = int(self.rfile.readline().split(b";")[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    return
+                self.rfile.read(size + 2)
+
+    def do_POST(self):
+        self.drain()
+        method = self.path.rsplit("/", 1)[-1]
+        if method == "getUpdates":
+            # Long polling. Answering instantly would spin the loop as fast as the container can
+            # go for the whole time it is up; one second is enough to keep that quiet and is far
+            # below anything the gate waits on.
+            time.sleep(1)
+            result = []
+        elif method == "getMe":
+            result = {"id": 123456789, "is_bot": True, "first_name": "Smoke",
+                      "username": "smoke_gate_bot"}
+        else:
+            # setMyCommands and everything else aiogram might send: `True` is the shape the Bot
+            # API returns for a method with no payload, and aiogram validates the response against
+            # the method's return type.
+            result = True
+        body = json.dumps({"ok": True, "result": result}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST
+
+
+# Bound and listening before main.py exists: ThreadingHTTPServer binds in its constructor, so the
+# socket is accepting by the time the bot makes its first request.
+SERVER = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+threading.Thread(target=SERVER.serve_forever, daemon=True).start()
+runpy.run_path(MAIN, run_name="__main__")
 '''
 
 
@@ -1522,8 +1800,8 @@ def check_image_contract(image):
             rows.append((target, (
                 "it is {!r}, expected {!r}. These numbers decide, against the ~120 s the Portainer "
                 "updater waits before rolling the image back, both how fast a good container can "
-                "report healthy (the first probe lands one --start-interval in, ~5 s) and how long "
-                "a bad one takes to be graded unhealthy (--start-period + --retries x --interval = "
+                "report healthy (its first probe, one --start-interval in, ~5 s) and how long a "
+                "bad one takes to be graded unhealthy (--start-period + --retries x --interval = "
                 "120 s, because failures inside the start period do not count towards the "
                 "retries)".format(actual, expected))))
     return rows
@@ -1622,9 +1900,10 @@ def start_boot_container(image, name, extra_env):
 
     `--network none` so the fake token below can never reach Telegram and so the container fails
     fast instead of retrying against the internet from a shared runner. It WILL die shortly after
-    the lines this gate is reading — the first API call has nowhere to go — and that is expected:
-    what is being checked is that startup reaches its first log lines and writes its mark, not that
-    a bot with a made-up token stays up.
+    the lines this gate is reading — the first API call has nowhere to go — and that is no longer
+    merely tolerated but checked: check_boot_cloud waits for the death and then requires that no
+    heartbeat was left behind. A container whose Bot API answers is a different arrangement
+    entirely and has its own starter, start_served_container.
     """
     remove_container(name)
     args = ["run", "-d", "--name", name, "--network", "none",
@@ -1639,56 +1918,205 @@ def start_boot_container(image, name, extra_env):
     return [("the container starts from the image's own CMD ({})".format(name), None)], True
 
 
-def check_boot_cloud(image, name):
-    """(b) The default branch: no Bot API server configured.
+def copy_out(name, path_in_container, destination):
+    """`docker cp` a file OUT of a container. Returns (status, output).
 
-    Eight rows: the container started, four log lines, the heartbeat file, the absence of a mark on
-    the volume path, and the token check. The log rows prove the process got past import, settings,
-    the database and the scheduler, and that a library's stdlib log record really came out through
-    loguru; the file rows prove the startup heartbeat this image's healthcheck depends on is
-    written by the real command, at the path the probe really looks at and at no other — none of
-    which the in-image probe can establish, because it never runs the CMD. This is the ONLY
-    container whose heartbeat file is read; check_boot_local exercises the other branch of the
-    endpoint decision, and the write below it is the same code either way.
+    `docker cp` rather than a bind mount: it streams over the API, so it works from a job container
+    whose filesystem the daemon cannot see — and it works on a container that has already exited,
+    which the cloud boot below always has.
+    """
+    return docker(["cp", "{}:{}".format(name, path_in_container), destination], COPY_TIMEOUT)
+
+
+def check_boot_cloud(image, name):
+    """(b) The NEGATIVE half, on the image's own CMD: a container whose Bot API is unreachable
+    must leave no mark.
+
+    Six rows: the container started, two log lines, it died, it left NO heartbeat, and the token
+    check. This is the end-to-end proof of the property main.py's call order exists for — the mark
+    is written by scheduler.start(), which runs only after the first Bot API request has been
+    answered, so a container that cannot reach its API has nothing for the probe to read and can
+    never report healthy. `--network none` is what makes api.telegram.org unreachable here, and it
+    is on every container this gate starts anyway.
+
+    The mutation this catches is the one that matters: move the API call back below
+    scheduler.start() and the mark appears, `docker cp` of it succeeds, and this row goes red.
     """
     rows, started = start_boot_container(image, name, {})
     if not started:
         return rows
 
-    logs = wait_for_markers(
-        name, (STARTUP_MARKER, CLOUD_ENDPOINT_MARKER, SCHEDULER_MARKER, BRIDGE_MARKER),
-        BOOT_BUDGET)
+    logs = wait_for_markers(name, (STARTUP_MARKER, CLOUD_ENDPOINT_MARKER), BOOT_BUDGET)
 
     for marker, what in ((STARTUP_MARKER, "the first line main.py logs"),
                          (CLOUD_ENDPOINT_MARKER,
                           "the endpoint line, cloud branch — the line that makes a misconfigured "
-                          "Bot API server visible instead of silent"),
-                         (SCHEDULER_MARKER,
-                          "the scheduler line, which also means the startup heartbeat write below "
-                          "it was reached"),
-                         (BRIDGE_MARKER,
-                          "an apscheduler record carried through the stdlib→loguru bridge — an "
-                          "INFO one, which `logging.lastResort` would have dropped, so its "
-                          "presence is the bridge working in the real image. That bridge is the "
-                          "only thing that makes a permanently failing getUpdates loop visible "
-                          "anywhere, and this is the one row that watches it end to end")):
+                          "Bot API server visible instead of silent")):
         target = "the log carries {!r} ({})".format(marker, what)
         rows.append((target, None) if marker in logs else (target, (
             "it never appeared within {} s. Log:\n{}".format(BOOT_BUDGET, excerpt(logs)))))
 
-    target = "the startup heartbeat really exists at {}".format(HEARTBEAT_IN_IMAGE)
-    # `docker cp` rather than a bind mount: it streams the file over the API, so it works from a job
-    # container whose filesystem the daemon cannot see — and it works on a container that has already
-    # exited, which this one may well have.
-    # Into a temporary directory, not next to this script: the checkout is what the workflow archives
-    # and a copy left behind by a failed read would be a stray file in it.
+    # WAIT FOR IT TO DIE before asking about the mark, rather than sampling a running container.
+    # Under the order this guards against, the mark is written a few microseconds after the
+    # endpoint line above — so a check that fired the moment that line appeared would be racing the
+    # very write it is supposed to catch. Once the process is gone there is nothing left to race.
+    target = "a container that cannot reach its Bot API dies instead of running on"
+    status, output = docker(["wait", name], WAIT_TIMEOUT)
+    exited = None
+    if status is None:
+        rows.append((target, "the check could not run: {}".format(output)))
+    else:
+        code = (output or "").strip().splitlines()
+        try:
+            exited = int(code[-1]) if code else None
+        except ValueError:
+            exited = None
+        if exited is None:
+            rows.append((target, "`docker wait` produced no exit code: {}".format(excerpt(output))))
+        elif exited == 0:
+            rows.append((target, (
+                "it exited 0. The first Bot API call has nowhere to go on `--network none`, so a "
+                "clean exit means the failure was swallowed somewhere and the process would go on "
+                "living — and reporting healthy — with a bot that never reached its server")))
+        else:
+            rows.append((target, None))
+
+    target = "and it left NO mark at {}".format(HEARTBEAT_IN_IMAGE)
+    # THE ROW THE CALL ORDER EXISTS FOR. scheduler.start() writes the startup mark, and main.py
+    # runs HealthBot.contact_api() — the first Bot API request — above it. This container's request
+    # cannot succeed, so there must be no mark: a `docker cp` of that path has to FAIL. With the
+    # API call back below the scheduler, as it used to be, the mark would be here, the probe would
+    # report healthy for the ~60 s until aiogram's request timeout fired, and the whole ~120 s
+    # updater window would pass green on an image that cannot talk to Telegram at all.
     scratch = tempfile.mkdtemp(prefix="smoke-cp-")
+    status, output = copy_out(name, HEARTBEAT_IN_IMAGE, os.path.join(scratch, "heartbeat"))
+    if status is None:
+        rows.append((target, "the check could not run: {}".format(output)))
+    elif status == 0:
+        rows.append((target, (
+            "the mark is there. It was written before the bot had reached its Bot API, so this "
+            "container would report healthy — which is exactly how an image pointed at an address "
+            "that swallows traffic used to survive the updater's window")))
+    else:
+        rows.append((target, None))
+    shutil.rmtree(scratch, ignore_errors=True)
+
+    rows.append(check_token_absent(name))
+    return rows
+
+
+def start_served_container(image, name):
+    """Create the SERVED container, copy the stub server into it, and start it.
+
+    Three docker calls instead of one `docker run`, because the stub has to be INSIDE the image
+    before the command runs and there is no filesystem shared with the daemon to mount it from.
+    `docker cp` into a created-but-not-started container is the way that works over the API alone —
+    the same reason the probe goes in on stdin.
+
+    The command is overridden, and this is the one container here that does not run the image's own
+    CMD. It runs a wrapper that executes the same /app/main.py through runpy; the CMD is pinned by
+    check_image_contract and exercised end to end by check_boot_cloud.
+    """
+    target = "the served container is created, given the stub server and started ({})".format(name)
+    remove_container(name)
+    args = ["create", "--name", name, "--network", "none",
+            "-e", "TELEGRAM_BOT_TOKEN=" + FAKE_TOKEN,
+            "-e", "TELEGRAM_BOT_API_SERVER=" + SERVED_API_SERVER,
+            image, "python", "-u", SERVED_WRAPPER_PATH]
+    status, output = docker(args, START_TIMEOUT)
+    if status != 0:
+        return [(target, "`docker create` returned {}: {}".format(status, excerpt(output)))], False
+
+    scratch = tempfile.mkdtemp(prefix="smoke-stub-")
+    local = os.path.join(scratch, os.path.basename(SERVED_WRAPPER_PATH))
+    try:
+        # `encoding="ascii"` deliberately: the wrapper must be ASCII-only, and this turns a
+        # violation into a UnicodeEncodeError here rather than into mojibake inside the container.
+        with open(local, "w", encoding="ascii") as handle:
+            handle.write(SERVED_WRAPPER)
+        status, output = docker(
+            ["cp", local, "{}:{}".format(name, SERVED_WRAPPER_PATH)], COPY_TIMEOUT)
+    except (OSError, UnicodeEncodeError) as error:
+        return [(target, "the stub could not be written: {}".format(error))], False
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if status != 0:
+        return [(target, "`docker cp` of the stub returned {}: {}".format(
+            status, excerpt(output)))], False
+
+    status, output = docker(["start", name], START_TIMEOUT)
+    if status != 0:
+        return [(target, "`docker start` returned {}: {}".format(status, excerpt(output)))], False
+    return [(target, None)], True
+
+
+def check_boot_served(image, name):
+    """(b) The POSITIVE half: the one container here whose Bot API answers.
+
+    Eight rows: it started, the endpoint decision took the configured-server branch and only that
+    branch, the scheduler line, the bridge record, the heartbeat file, the absence of a mark on the
+    volume path, and the token check.
+
+    Everything below the endpoint rows is only reachable because the request succeeded, which is
+    the point: it is the proof that a GOOD image still gets all the way to a mark under the new
+    call order. The stub is on 127.0.0.1 inside this same container — loopback exists and is up
+    under `--network none` (verified on nebula, Docker 27.1.1) — so nothing here can reach Telegram any
+    more than the other containers can.
+
+    It also carries the end-to-end half of the endpoint regression test: the probe checks that the
+    SESSION points at the configured server; this checks that TELEGRAM_BOT_API_SERVER, spelled the
+    way the stack spells it, reaches that decision in the real image, that the log says so with the
+    address in it, and — now — that requests really go there, because a bot still talking to the
+    cloud would never have got past contact_api() on a container with no network.
+    """
+    rows, started = start_served_container(image, name)
+    if not started:
+        return rows
+
+    logs = wait_for_markers(
+        name, (SERVED_ENDPOINT_MARKER, SCHEDULER_MARKER, BRIDGE_MARKER), BOOT_BUDGET)
+
+    target = "TELEGRAM_BOT_API_SERVER reaches the bot: the log names the configured server"
+    if SERVED_ENDPOINT_MARKER in logs:
+        rows.append((target, None))
+    else:
+        rows.append((target, (
+            "{!r} never appeared within {} s — the name the stack passes is being dropped again. "
+            "Log:\n{}".format(SERVED_ENDPOINT_MARKER, BOOT_BUDGET, excerpt(logs)))))
+
+    target = "and it does NOT fall back to the cloud endpoint"
+    if CLOUD_ENDPOINT_MARKER not in logs:
+        rows.append((target, None))
+    else:
+        rows.append((target, "the log carries the cloud line as well, so the branch was not taken"))
+
+    for marker, what in ((SCHEDULER_MARKER,
+                          "the scheduler line, which means the first Bot API request was answered "
+                          "— it runs after HealthBot.contact_api() — and that the startup "
+                          "heartbeat write below it was reached"),
+                         (BRIDGE_MARKER,
+                          "an apscheduler record carried through the stdlib→loguru bridge — an "
+                          "INFO one, which an unbridged stdlib logger discards before it is even "
+                          "built, so its presence is the bridge working in the real image. That "
+                          "bridge is the only thing that makes a permanently failing getUpdates "
+                          "loop visible anywhere, and this is the one row that watches it end to "
+                          "end")):
+        target = "the log carries {!r} ({})".format(marker, what)
+        rows.append((target, None) if marker in logs else (target, (
+            "it never appeared within {} s. Log:\n{}".format(BOOT_BUDGET, excerpt(logs)))))
+
+    scratch = tempfile.mkdtemp(prefix="smoke-cp-")
+
+    target = "the startup heartbeat really exists at {}".format(HEARTBEAT_IN_IMAGE)
+    # Into a temporary directory, not next to this script: the checkout is what the workflow
+    # archives and a copy left behind by a failed read would be a stray file in it.
     local = os.path.join(scratch, "heartbeat")
-    status, output = docker(["cp", "{}:{}".format(name, HEARTBEAT_IN_IMAGE), local], COPY_TIMEOUT)
+    status, output = copy_out(name, HEARTBEAT_IN_IMAGE, local)
     if status != 0:
         rows.append((target, (
             "`docker cp` returned {}: {}. The first health probe of a fresh container would read a "
-            "missing mark".format(status, excerpt(output)))))
+            "missing mark, so a good image would never reach `healthy`".format(
+                status, excerpt(output)))))
     else:
         try:
             with open(local) as handle:
@@ -1709,14 +2137,13 @@ def check_boot_cloud(image, name):
 
     target = "and nothing was written to {}, the path on the data volume".format(
         HEARTBEAT_NOT_ON_VOLUME)
-    # THE OUTSIDE HALF OF THE INHERITED-MARK DEFENCE. That defence is a location, so this is the
-    # row that guards it in the real image: the data directory is the volume Portainer's updater
-    # carries from a retired container to its replacement, and a mark left there would be handed
-    # to the next container seconds old and read as fresh — reporting healthy a container that has
+    # THE OUTSIDE HALF OF THE RECREATE DEFENCE, and it belongs on this container because this is
+    # the only one that writes a mark at all. The data directory is the volume Portainer's updater
+    # carries from a retired container to its replacement, and a mark left there would be handed to
+    # the next container seconds old and read as fresh — reporting healthy a container that has
     # done nothing yet. `docker cp` of that path must therefore FAIL.
     on_volume = os.path.join(scratch, "heartbeat-on-volume")
-    status, output = docker(
-        ["cp", "{}:{}".format(name, HEARTBEAT_NOT_ON_VOLUME), on_volume], COPY_TIMEOUT)
+    status, output = copy_out(name, HEARTBEAT_NOT_ON_VOLUME, on_volume)
     if status is None:
         rows.append((target, "the check could not run: {}".format(output)))
     elif status == 0:
@@ -1727,39 +2154,6 @@ def check_boot_cloud(image, name):
     else:
         rows.append((target, None))
     shutil.rmtree(scratch, ignore_errors=True)
-
-    rows.append(check_token_absent(name))
-    return rows
-
-
-def check_boot_local(image, name):
-    """(b) The other branch: TELEGRAM_BOT_API_SERVER set, exactly as the stack passes it.
-
-    This is the end-to-end half of the endpoint regression test. The probe checks that the SESSION
-    points at the configured server; this checks that the variable production really sets, spelled
-    the way production really spells it, reaches that decision in the real image — and that the log
-    says so, with the address in it.
-    """
-    rows, started = start_boot_container(image, name,
-                                         {"TELEGRAM_BOT_API_SERVER": LOCAL_API_SERVER})
-    if not started:
-        return rows
-
-    logs = wait_for_markers(name, (LOCAL_ENDPOINT_MARKER,), BOOT_BUDGET)
-
-    target = "TELEGRAM_BOT_API_SERVER reaches the bot: the log names the local server"
-    if LOCAL_ENDPOINT_MARKER in logs:
-        rows.append((target, None))
-    else:
-        rows.append((target, (
-            "{!r} never appeared within {} s — the name the stack passes is being dropped again. "
-            "Log:\n{}".format(LOCAL_ENDPOINT_MARKER, BOOT_BUDGET, excerpt(logs)))))
-
-    target = "and it does NOT fall back to the cloud endpoint"
-    if CLOUD_ENDPOINT_MARKER not in logs:
-        rows.append((target, None))
-    else:
-        rows.append((target, "the log carries the cloud line as well, so the branch was not taken"))
 
     rows.append(check_token_absent(name))
     return rows
@@ -1898,7 +2292,7 @@ def main():
         rows.extend(probe_rows)
 
         rows.extend(check_boot_cloud(image, name + BOOT_CLOUD_SUFFIX))
-        rows.extend(check_boot_local(image, name + BOOT_LOCAL_SUFFIX))
+        rows.extend(check_boot_served(image, name + BOOT_SERVED_SUFFIX))
     finally:
         # Unconditionally. When a bound fires inside docker() it kills the docker CLIENT on the
         # runner, not the container on the daemon, so a hung run would otherwise sit here pinning the
@@ -1919,13 +2313,13 @@ def main():
 
     # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
     # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 118/118` — three short of the 121 below, and indistinguishable
+    # so the run would end `smoke ok: 124/124` — three short of the 127 below, and indistinguishable
     # from a good run to anybody not counting — exit 0, and have every printed row saying ok with
     # several claims silently no longer made.
     #
     # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
     # failing check legitimately reports fewer rows than its happy path — run_probe emits 1 instead
-    # of the 99 (97 from the probe plus its 2 consistency rows) a green run produces, when its
+    # of the 103 (101 from the probe plus its 2 consistency rows) a green run produces, when its
     # container never started — so on an already-red run this row would fire too, on top of the real
     # failure, and read as though the GATE were broken. The fault it exists to catch is invisible on
     # a red run and decisive on a green one, which is exactly where it is reported.

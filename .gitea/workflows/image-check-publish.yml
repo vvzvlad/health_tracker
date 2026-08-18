@@ -70,13 +70,13 @@ jobs:
     # runner's own name here would leave the job queued forever, because no runner offers a label by
     # that name.
     runs-on: ubuntu-latest
-    # The three step-level timeouts below come to 60 minutes (20 build + 25 smoke + 15 push); 75
+    # The three step-level timeouts below come to 65 minutes (20 build + 30 smoke + 15 push); 80
     # leaves 15 on top for checkout, the tag computation, the registry login, the two cleanup steps
     # and the logout. The outer bound has to EXCEED the sum, not equal it: act_runner kills the whole
     # job when this fires, and a step marked `if: always()` is not guaranteed to run afterwards — so
     # a job that dies mid-push leaves the smoke containers and a few hundred MB of image sitting on
     # the daemon the entire fleet shares.
-    timeout-minutes: 75
+    timeout-minutes: 80
     # Job-level, so the smoke step and the cleanup step cannot disagree about it. They are the ends
     # of the same mechanism — ci/smoke.py names its containers after this, the cleanup step removes
     # them by the same names — and written as separate literals they would go on looking correct
@@ -194,12 +194,13 @@ jobs:
       # the container it is the other way round — the image's own interpreter is `python` — and
       # ci/smoke.py invokes it accordingly.
       #
-      # 25 minutes, against ci/smoke.py's own worst case of 18 if every docker call it makes runs
+      # 30 minutes, against ci/smoke.py's own worst case of 22 if every docker call it makes runs
       # out its bound — the arithmetic is written out over the bounds block in that file, and the
-      # two numbers are meant to be revisited together. In practice the gate is well under two
+      # two numbers are meant to be revisited together, as they were when the served boot container
+      # was added and took the worst case from 18.5 to 22. In practice the gate is well under two
       # minutes. Being killed BY this timeout is what the margin is for: the script's own container
       # cleanup would not run, and the `if: always()` step below catches that.
-      timeout-minutes: 25
+      timeout-minutes: 30
       env:
         SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
       # The executable lines of this step are identical to those of the step of the same name in
@@ -266,7 +267,7 @@ jobs:
         # The three suffixes ci/smoke.py uses, kept in step with ALL_SUFFIXES there. No `set -eu`
         # here on purpose: this is best-effort cleanup, every removal already ends in `|| true`, and
         # failing the step would turn a leftover container into a red job.
-        for suffix in -probe -boot-cloud -boot-local; do docker rm -f "$SMOKE_NAME$suffix" || true; done
+        for suffix in -probe -boot-cloud -boot-served; do docker rm -f "$SMOKE_NAME$suffix" || true; done
 
     - name: Remove the built images from the runner
       # The runner's docker daemon is persistent, so the images built here would otherwise pile up

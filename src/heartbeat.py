@@ -26,9 +26,23 @@ import time
 # report `healthy` for work another container did. That is precisely the failure this
 # healthcheck exists to catch.
 #
-# /tmp is in the container's own writable layer, which the daemon creates EMPTY for every
-# container it creates. A mark from the previous container therefore cannot be here: not
-# "is rejected when found", but cannot exist. Nothing needs to check for one.
+# /tmp is in the container's own writable layer, and the daemon creates that layer EMPTY when it
+# CREATES a container. An updater REPLACES the container, so the mark cannot cross from the
+# retired one to its replacement — that whole scenario is closed by the location alone.
+# (Two claims there, both verified on nebula — Docker 27.1.1, the version production runs — and
+# the second one is narrower than it is usually written: it is the LAYER that is empty. `/tmp` as
+# seen inside the container is that layer over the image's own /tmp, so an image shipping files in
+# /tmp would show them. python:3.x-slim was checked and ships an empty /tmp, which is why the two
+# coincide here — but that is a property of the base image, not a law.)
+#
+# WHAT THE LOCATION DOES NOT COVER, and this is the half that gets forgotten: the layer survives
+# a RESTART of the same container. `docker restart`, `restart: unless-stopped` after the process
+# dies, `docker stop && docker start`, a host reboot — all of them start a new process over the
+# SAME writable layer, with the previous run's mark still in it, at most HEARTBEAT_INTERVAL old.
+# Docker resets the health state to `starting` on a restart (verified on nebula, 27.1.1), so the new run is
+# graded from scratch: its first probe reads that inherited mark, finds it fresh, and reports
+# healthy a process that is at that moment wedged in db.init(). clear_heartbeat(), called from
+# main.py before anything that can block, is what closes THAT — see its docstring.
 #
 # So do not move this next to the database to keep it "with the data". The mark is not data:
 # it is worth nothing a second after the process that wrote it stopped, it must not outlive the
@@ -39,7 +53,9 @@ import time
 # main.py` had written the very same `1` the check would have been looking for.
 #
 # The one known cost: a container run with a read-only root filesystem and no tmpfs at /tmp
-# cannot write the mark at all, and would never report healthy. The stack uses neither.
+# cannot write the mark at all. The stack uses neither, and if one ever did, write_first_heartbeat()
+# below makes that stop the container with the reason on its last line rather than leave it
+# silently un-healthy forever.
 DEFAULT_HEARTBEAT_FILE = "/tmp/heartbeat"
 
 # How often src/scheduler.py rewrites the mark. It is a job of its own — one write, no network
@@ -53,10 +69,10 @@ HEARTBEAT_INTERVAL = 30
 # intervals, so it moves only if HEARTBEAT_INTERVAL moves.
 # WHAT RAISING IT WOULD COST, stated exactly, because the obvious guess is wrong. It is NOT
 # about the ~120 s window Portainer's updater waits for `healthy`. A container that wedges
-# right after its startup mark reports healthy in ~5 s and holds that verdict through the whole
-# window at 90 exactly as it would at 180: `unhealthy` takes three consecutive failed probes
-# AFTER the mark goes stale, so the earliest it can be graded is 90 + up to 30 to the first
-# probe + 60 for the other two = 150-180 s, past the window either way. A tolerance below the
+# right after its startup mark reports healthy at its first probe, about 5 s in, and holds that
+# verdict through the whole window at 90 exactly as it would at 180: `unhealthy` takes three consecutive
+# failed probes AFTER the mark goes stale, so the earliest it can be graded is 90 + up to 30 to the
+# first probe + 60 for the other two = 150-180 s, past the window either way. A tolerance below the
 # window would not save that container either, only shorten the lie.
 # What the number really buys is DETECTION SPEED in production, on a container that has been up
 # for hours: 150-180 s after its last successful mark at this tolerance, against 240-270 s at
@@ -78,8 +94,8 @@ def heartbeat_file():
     and DEFAULT_HEARTBEAT_FILE explains at length why that cannot be allowed back.
 
     NOTE for the override: a HEARTBEAT_FILE pointing at a mounted path (a volume, a bind mount)
-    gives up the guarantee above and reinstates inherited marks. clear_heartbeat() is what
-    covers that case.
+    gives up even the recreate half of the guarantee above — the mark then survives the container
+    itself. clear_heartbeat() covers that case as well as the restart case it exists for.
     """
     return os.getenv("HEARTBEAT_FILE") or DEFAULT_HEARTBEAT_FILE
 
@@ -94,8 +110,20 @@ def format_mark(timestamp):
     return "{}".format(int(timestamp))
 
 
-def write_heartbeat(path, logger=None):
-    """Best-effort liveness mark; heartbeat I/O must never break the job writing it.
+class HeartbeatUnwritable(RuntimeError):
+    """The STARTUP mark could not be written. Raised by write_first_heartbeat() only.
+
+    It exists because the failure it reports is silent in the worst possible direction. A
+    container whose /tmp is not writable — a read-only root filesystem with no tmpfs, a volume
+    mounted over /tmp, a full disk — runs the bot perfectly and never writes a mark, so the probe
+    reports `unhealthy` forever and the updater rolls back a GOOD image, over and over, with a
+    warning every 30 s as the only trace. src/scheduler.py names that direction of wrongness as
+    worse than having no probe at all; this is the class that stops it being reachable in silence.
+    """
+
+
+def _write_mark(path):
+    """The write itself, shared by both callers below.
 
     WRITTEN THROUGH A TEMPORARY FILE AND os.replace(), which is atomic on POSIX. A plain
     `open(path, "w")` truncates first and writes after, leaving a window in which the file is
@@ -103,30 +131,76 @@ def write_heartbeat(path, logger=None):
     so it is a window that will eventually be hit. It would report a malformed mark, i.e.
     `unhealthy`, on a container doing exactly what it should. The temporary file is in the same
     directory deliberately: os.replace() is only atomic within one filesystem.
+    """
+    temporary = path + ".new"
+    with open(temporary, "w") as handle:
+        handle.write(format_mark(time.time()))
+    os.replace(temporary, path)
+
+
+def write_heartbeat(path, logger=None):
+    """The PERIODIC mark: best-effort, because heartbeat I/O must never break the job writing it.
 
     A raise here would propagate out of the job and be swallowed by APScheduler, which would
     cost the heartbeat over a full disk without saying so. A warning in the log and a stale
     mark say the same thing far more usefully: the probe will report it.
+
+    This is the right trade for the SECOND write onwards — by then the mark has been written
+    once, so the path is known to work and a failure here is a change of circumstances the probe
+    is entitled to grade. The FIRST write is a different question and has its own function.
     """
     try:
-        temporary = path + ".new"
-        with open(temporary, "w") as handle:
-            handle.write(format_mark(time.time()))
-        os.replace(temporary, path)
-    except Exception as error:  # noqa: BLE001 - a failed heartbeat must not raise
+        _write_mark(path)
+    except Exception as error:  # noqa: BLE001 - a failed periodic heartbeat must not raise
         if logger is not None:
             logger.warning("Failed to write heartbeat {}: {}", path, error)
+
+
+def write_first_heartbeat(path):
+    """The STARTUP mark, and this one is LOUD: it raises HeartbeatUnwritable.
+
+    Deliberately NOT best-effort like write_heartbeat() above, because the two failures are not
+    the same failure. A periodic write that fails after the mark has existed once makes the mark
+    go stale, which the probe reports and which is the correct verdict for a container whose disk
+    filled up. A FIRST write that fails means the mark never existed at all — and "never healthy"
+    is indistinguishable, to Portainer's updater, from a broken image, so a perfectly working bot
+    gets rolled back on every deploy while its only complaint is a warning line every 30 s.
+
+    Dying instead turns that into a container that stops, with the reason on its last line. The
+    verdict is the same either way (the update does not stick); what changes is whether anybody
+    can tell why.
+
+    The message names the path and the fix, and nothing else — no secret is in scope here.
+    """
+    try:
+        _write_mark(path)
+    except Exception as error:  # noqa: BLE001 - re-raised as HeartbeatUnwritable below
+        raise HeartbeatUnwritable(
+            "cannot write the startup heartbeat to {}: {}. The health probe reads that file and "
+            "nothing else, so this container would never report healthy however well the bot "
+            "worked — and an image whose container does not reach `healthy` is exactly what "
+            "Portainer's updater rolls back. Give the container a writable /tmp (a tmpfs entry "
+            "will do) or point HEARTBEAT_FILE at a path it can write.".format(path, error)
+        ) from error
 
 
 def clear_heartbeat(path, logger=None):
     """Drop whatever mark is already at `path`, at the very start of a process.
 
-    WITH THE DEFAULT PATH THIS IS A NO-OP, and it is kept knowing that: /tmp is in the
-    container's writable layer, so on a fresh container there is nothing there to remove. What
-    it still covers is the one configuration that CAN inherit a mark — a HEARTBEAT_FILE
-    override pointing at a mounted path, which is a supported thing to do and would otherwise
-    reinstate the hole DEFAULT_HEARTBEAT_FILE closes. One os.remove() at startup is a cheap
-    price for making the override as safe as the default.
+    THIS IS LOAD-BEARING ON THE DEFAULT PATH, and it is worth being exact about why, because the
+    obvious reading of DEFAULT_HEARTBEAT_FILE ("the layer is created empty, so there is never
+    anything to delete") is wrong in one specific and entirely ordinary case. The layer is new
+    when the container is CREATED — that is the updater's case and it needs nothing from here.
+    But the layer SURVIVES A RESTART of the same container: `docker restart`, `restart:
+    unless-stopped` after the process falls over, `docker stop && docker start`, a host reboot.
+    The new run then starts with the previous run's mark on disk, at most HEARTBEAT_INTERVAL
+    old, while docker has reset the health state to `starting` and is probing from scratch — so
+    the first probe reads a mark that is fresh by its standard and reports healthy a process
+    that has got no further than db.init(). One os.remove() here is the whole of the defence
+    against that.
+
+    It covers the HEARTBEAT_FILE override into the bargain: pointed at a volume or a bind mount,
+    the mark survives recreation too, and the same call removes it.
 
     It has to run before anything that can block: a startup that hangs after this call leaves
     no mark at all, which is exactly the verdict wanted.

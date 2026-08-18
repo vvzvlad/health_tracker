@@ -22,35 +22,72 @@ RUN mkdir -p data
 # It reads the heartbeat written by a job that does nothing else, every 30 s (src/heartbeat.py,
 # src/scheduler.py), so the verdict is about the asyncio loop still turning rather than about a
 # process still existing. The mark is written to /tmp, i.e. into the container's own writable
-# layer, which the daemon creates empty for each container — so a mark left by the container
-# this one replaced cannot be at that path and cannot report the new container healthy before
-# it has ticked once. That property comes from WHERE the file is, not from anything in it; see
-# DEFAULT_HEARTBEAT_FILE in src/heartbeat.py before moving it.
+# layer, which the daemon creates empty when it CREATES a container — so a mark left by the
+# container this one REPLACED cannot be at that path. That half comes from WHERE the file is and
+# from nothing in it. The other half is not free: the same layer survives a RESTART of this
+# container (`docker restart`, `restart: unless-stopped`, a host reboot), which would hand the
+# new run the previous run's mark, so main.py deletes any mark it finds before it does anything
+# that can block. Read DEFAULT_HEARTBEAT_FILE and clear_heartbeat in src/heartbeat.py before
+# moving either.
 #
 # WHAT IT PROVES IS NARROWER THAN "the image works", and the difference decides which bad
-# images this rolls back. Green here means: the process is up and its scheduler is dispatching.
+# images this rolls back. Green here means: the process is up, it reached its Bot API once and
+# was accepted, and its scheduler is dispatching.
 # It says NOTHING about the bot serving anybody ONCE STARTUP HAS SUCCEEDED. aiogram's
 # `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever, so
 # a failure that arrives after that point — 409 because something else started polling the same
 # bot, a revoked token, a Bot API server that goes away — leaves the process alive, the
 # scheduler ticking, the mark fresh and this probe green while nobody is served. An image broken
 # THAT way gets published, deployed and reported healthy. What makes it visible is the log, and
-# only because src/logging_setup.py routes aiogram's stdlib logger into loguru instead of
-# leaving it to `logging.lastResort`.
-# A failure present AT startup is caught here rather than hidden: `HealthBot.start()` calls
-# set_my_commands before it polls, so a wrong address or a refused connection raises, the
-# process dies, and a container that keeps dying never reaches `healthy` — which is exactly the
-# signal the updater rolls back on.
+# only because src/logging_setup.py routes aiogram's stdlib logger into loguru. Without that
+# bridge such a record has no handler on its chain at all: below WARNING the logger drops it
+# before it is even built (the effective level is root's default of WARNING), and at WARNING and
+# above it leaves through `logging.lastResort` — unformatted, unattributed and unredacted.
+# A failure present AT startup is caught here rather than hidden, and that includes the slow
+# kind, which it did not until the call order was fixed. main.py calls HealthBot.contact_api()
+# — the first Bot API request — BEFORE scheduler.start(), and the scheduler's start is what
+# writes the first mark. So no mark exists until the bot has been answered by its server: a
+# refused connection, an address that resolves nowhere or a 401 kills the process at once, and an
+# address that merely black-holes traffic (a wrong IP on the right subnet, a closed port, a host
+# that is down — the ordinary way this gets misconfigured on a LAN) holds the request for
+# aiogram's 60 s per-request timeout and then kills it. Neither ever reports healthy.
+# With the API call BELOW the scheduler, as it was, the black-hole case was not caught at all: the
+# mark appeared within a second or two of startup, so the container was healthy at its first probe
+# (~5 s) and stayed healthy for the ~60 s until the timeout fired — covering the updater's window.
+# The broken image was accepted, and under `restart: unless-stopped` it was re-accepted for as long
+# as anybody left it alone.
+# The process must also DIE rather than hang when that request fails, which is not free: see the
+# comment on the `finally` in main.py, and the aiosqlite thread it is there for.
 #
 # THE TIMINGS ARE LOAD-BEARING, not taste. Portainer's updater waits roughly 120 s for a freshly
 # deployed container to report `healthy` and rolls the image back if it does not, so what these
 # four numbers really decide is whether an automatic update sticks.
-#   * DURING --start-period docker probes every --start-interval (5 s by default, on Docker
-#     >= 25.0) and the FIRST success marks the container healthy immediately. Measured on
-#     this image: healthy 5.4 s after start, on Docker 29.7.2; the production daemon is on
-#     27.1.1, which behaves the same. That fast path exists only because the scheduler writes
-#     one mark at startup — the 30 s heartbeat job's own first run is a whole interval away,
-#     so without that write the early probes find no file.
+#   * THE PROBE SCHEDULE, measured on nebula — Docker 27.1.1, the version production runs — with
+#     exactly the four numbers below and a check that always fails, so the whole cadence is
+#     visible: probes at +20.3, +25.4, +30.4, +60.5, +90.5 s. Read that as: docker probes every
+#     --start-interval WHILE --start-period is running (5 s, the documented default since Docker
+#     25, and it applies WITHOUT the flag being declared — a container given an explicit
+#     --health-start-interval=5s first-probed at +5.3 s against +5.2 s without it, i.e. no
+#     difference), then falls back to --interval, 30 s, once the start period ends. The FIRST
+#     success marks the container healthy, so a good container is healthy at about 5 s on any
+#     daemon >= 25. Other park hosts run 28.3.1 and 29.x and were not measured; nothing here
+#     depends on a version-specific quirk, only on that documented default.
+#     DELIBERATELY NOT DECLARING --start-interval=5s: the default already gives 5 s on every daemon
+#     we run, and pinning it explicitly would buy version-independence at the price of one more
+#     expectation to keep in step in ci/smoke.py.
+#     The startup mark is what makes that 5 s real. Without it the first mark would be the
+#     heartbeat job's own first run, one whole interval after the scheduler starts, i.e. ~32 s in —
+#     past every start-period probe — so the first passing probe would be the +60 s one and
+#     `healthy` would slip from ~5 s to ~60 s, half the updater's window.
+#   * WHAT THE CALL-ORDER FIX COSTS, against that schedule. The mark now appears at (startup + one
+#     Bot API request, call it R) rather than at (startup), and `healthy` at the first probe at or
+#     after it. With R in milliseconds — the local Bot API server on the LAN — NOTHING MOVES: the
+#     mark is on disk before the +5 s probe, exactly as before. R has to exceed ~28 s to push the
+#     mark past the start period at all, and it cannot exceed 60 s without raising, because that is
+#     aiogram's per-request timeout and there is one attempt, no retry. So the worst SUCCESSFUL
+#     start is a mark at ~62 s picked up by the +90 s probe: inside the ~120 s window with about
+#     30 s to spare. Anything slower than aiogram's timeout is not a slow start, it is a start that
+#     failed — and that is the verdict wanted.
 #   * A container that NEVER becomes healthy is only GRADED `unhealthy` at about
 #     --start-period + --retries x --interval = 30 + 3 x 30 = 120 s, because failures inside
 #     the start period do not increment the retry counter — the counter starts when the start

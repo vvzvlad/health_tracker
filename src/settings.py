@@ -3,6 +3,8 @@ from urllib.parse import urlsplit
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from src.logging_setup import LOG_LEVELS
+
 
 class Settings(BaseSettings):
     telegram_bot_token: str
@@ -87,6 +89,42 @@ class Settings(BaseSettings):
                 "must start with http:// or https:// — a bare host:port cannot be turned into "
                 "a request URL, and the library error that would follow quotes the full URL, "
                 "which carries the bot token"
+            )
+        return value
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalise_log_level(cls, value: str) -> str:
+        """Upper-case the level, treat a blank value as "not set", and reject an unknown name.
+
+        THE CASE IS THE WHOLE POINT, and it is the same class of failure as the empty server
+        address above. loguru's level names are upper case and its lookup is exact: on the pinned
+        loguru 0.7.2 both `logger.add(sink, level="info")` and `logger.level("info")` raise
+        `ValueError: Level 'info' does not exist`. This field was a plain `str` with no
+        normalisation, so `LOG_LEVEL=info` in a stack — which is how most people write it —
+        raised inside configure_logging(), i.e. BEFORE the sink and the excepthook it installs
+        existed: an unformatted crash, on every restart, forever.
+
+        A blank value falls back to the default for the same reason the server address does:
+        `LOG_LEVEL=` in a compose file, or an empty field in Portainer, sets an empty STRING, and
+        pydantic-settings does not treat that as absent.
+
+        An unknown name is REJECTED HERE rather than left to blow up later. Both are a startup
+        failure, but this one names the field and the accepted spellings, and it arrives as a
+        pydantic error rather than as a bare ValueError from inside the logging setup.
+
+        Unlike the token, the value is safe to quote: a log level is not a secret, so pydantic
+        appending `input_value=...` to the message is help rather than a leak. That asymmetry is
+        exactly why telegram_bot_token still has no validator — see the note above.
+        """
+        value = value.strip().upper()
+        if not value:
+            return "INFO"
+        if value not in LOG_LEVELS:
+            raise ValueError(
+                "LOG_LEVEL must be one of {} (case does not matter, the value is upper-cased "
+                "here); loguru rejects anything else, and it does so inside the logging setup, "
+                "before there is a sink to report it through".format(", ".join(LOG_LEVELS))
             )
         return value
 

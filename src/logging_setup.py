@@ -14,9 +14,14 @@ container lives, and the updater's containers live a long time.
   before it reaches stderr. src/settings.py refuses a schemeless server URL outright, so the
   path above is closed at its source; this covers the paths nobody has thought of yet.
 * STDLIB LOGGING IS REROUTED into loguru. aiogram, apscheduler and aiohttp all log through the
-  stdlib `logging` module, and main.py used to configure loguru alone — so those records had
-  no handler at all and went out through `logging.lastResort`: stderr, WARNING and above only,
-  a different format, and past both LOG_LEVEL and the redaction above. Routing them here is
+  stdlib `logging` module, and main.py used to configure loguru alone — so those records had no
+  handler anywhere on their chain. Two things then happened to them, and they are worth keeping
+  apart because the usual one-line summary ("lastResort drops them") names the wrong mechanism.
+  A record below WARNING never got as far as a handler at all: `Logger.isEnabledFor` compares
+  against the EFFECTIVE level, which with nothing configured is the root logger's default of
+  WARNING, so the record was not even created — verified on this project's interpreter. A record
+  at WARNING or above WAS emitted, through `logging.lastResort`: stderr, bare message, no
+  attribution, and past both LOG_LEVEL and the redaction above. Routing them here is
   also the only reason a polling failure is visible at all: aiogram's
   `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever
   behind a backoff, so a bot whose polling has permanently failed — a 409 because something
@@ -51,6 +56,18 @@ TOKEN_PLACEHOLDER = "***REDACTED***"
 # log readable is worth more than scrubbing it. A real token, and a real token's secret half,
 # are both far above this.
 MIN_SECRET_LENGTH = 8
+
+# The level names loguru knows, and the ONLY values `logger.add(level=...)` and `logger.level()`
+# accept. Checked against loguru 0.7.2, which is what requirements.txt pins: both raise
+# `ValueError: Level 'info' does not exist` for anything outside this tuple — INCLUDING a correct
+# name in the wrong case, which is the trap this exists for.
+#
+# It lives here, next to the code that consumes it, and src/settings.py imports it to validate
+# LOG_LEVEL. That is the position that matters: configure_logging() runs BEFORE the sink and the
+# excepthook exist, so a ValueError raised inside it is an unformatted crash on every restart,
+# forever — the same class of failure as the empty TELEGRAM_BOT_API_SERVER. Rejecting the value
+# in Settings instead at least names the field and the accepted spellings.
+LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
 
 
 def redact(text, token):
@@ -101,7 +118,13 @@ class InterceptHandler(logging.Handler):
 
 
 def configure_logging(token, level="INFO"):
-    """Install the redacting sink, the stdlib bridge and the excepthook. Call once, first."""
+    """Install the redacting sink, the stdlib bridge and the excepthook. Call once, first.
+
+    `level` must already be one of LOG_LEVELS. This function CANNOT report a bad one usefully —
+    it runs before the sink and the excepthook it is installing exist, so a raise here is an
+    unformatted traceback in a restart loop. src/settings.py is where a value out of the
+    environment is normalised and rejected, and it names the variable when it does.
+    """
     logger.remove()
 
     def sink(message):
