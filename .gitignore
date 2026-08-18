@@ -18,3 +18,5 @@ venv.bak/
 .kilocode/mcp.json
 data/medications.db
 test_medications.db
+# The liveness mark the scheduler writes next to the database; runtime state, not source.
+data/heartbeat
