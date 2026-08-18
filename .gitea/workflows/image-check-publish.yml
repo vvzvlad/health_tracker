@@ -37,6 +37,15 @@ on:
   # reason.
   push:
     branches: [ "master", "main" ]
+    # Documentation must not redeploy the bot. Every run of this workflow moves :latest, and the
+    # deployed container carries `io.portainer.update.enable`, so an updater picks that up and
+    # RESTARTS production — for a commit that changed nothing inside the image.
+    # `*.md` and not `**.md`, deliberately: the double-star form would also cover a future
+    # `ci/NOTES.md` or `.gitea/workflows/README.md`, and a filter that can make a commit touching
+    # the CI directories skip the build is a filter that lets a change to the gate go unverified.
+    # Root-level markdown is the only thing being excluded here.
+    paths-ignore:
+      - '*.md'
 
 # No `packages: write` here: that scope is GitHub-specific and has no effect on Gitea Actions — the
 # built-in token carries no package scope at all. The registry push below authenticates with the
@@ -61,13 +70,13 @@ jobs:
     # runner's own name here would leave the job queued forever, because no runner offers a label by
     # that name.
     runs-on: ubuntu-latest
-    # The three step-level timeouts below come to 55 minutes (20 build + 20 smoke + 15 push); 70
+    # The three step-level timeouts below come to 60 minutes (20 build + 25 smoke + 15 push); 75
     # leaves 15 on top for checkout, the tag computation, the registry login, the two cleanup steps
     # and the logout. The outer bound has to EXCEED the sum, not equal it: act_runner kills the whole
     # job when this fires, and a step marked `if: always()` is not guaranteed to run afterwards — so
     # a job that dies mid-push leaves the smoke containers and a few hundred MB of image sitting on
     # the daemon the entire fleet shares.
-    timeout-minutes: 70
+    timeout-minutes: 75
     # Job-level, so the smoke step and the cleanup step cannot disagree about it. They are the ends
     # of the same mechanism — ci/smoke.py names its containers after this, the cleanup step removes
     # them by the same names — and written as separate literals they would go on looking correct
@@ -185,18 +194,20 @@ jobs:
       # the container it is the other way round — the image's own interpreter is `python` — and
       # ci/smoke.py invokes it accordingly.
       #
-      # 20 minutes, against ci/smoke.py's own worst case of roughly 13 if every docker call it makes
-      # runs out its bound. In practice the gate is well under two minutes. Being killed BY this
-      # timeout is what the margin is for: the script's own container cleanup would not run, and the
-      # `if: always()` step below catches that.
-      timeout-minutes: 20
+      # 25 minutes, against ci/smoke.py's own worst case of 18 if every docker call it makes runs
+      # out its bound — the arithmetic is written out over the bounds block in that file, and the
+      # two numbers are meant to be revisited together. In practice the gate is well under two
+      # minutes. Being killed BY this timeout is what the margin is for: the script's own container
+      # cleanup would not run, and the `if: always()` step below catches that.
+      timeout-minutes: 25
       env:
         SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
-      # The body of this step is byte-identical to the one in tests.yml. Only the `env:` value above
-      # differs. The PR gate and the publishing gate must run the same checks against the same kind
-      # of image, and the cheapest way to guarantee that is for the two to be literally the same
-      # text — anything else drifts, and it drifts silently, in the direction of the PR gate testing
-      # less.
+      # The executable lines of this step are identical to those of the step of the same name in
+      # tests.yml; only the `env:` value above differs, and the comments differ freely. The PR gate
+      # and the publishing gate must run the same checks against the same kind of image — anything
+      # else drifts, silently, in the direction of the PR gate testing less. That is not left to
+      # good intentions: ci/smoke.py compares the two files itself and fails the gate when the
+      # duplicated steps stop running the same lines.
       run: |
         python3 ci/smoke.py
 

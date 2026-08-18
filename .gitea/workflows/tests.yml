@@ -38,12 +38,12 @@ jobs:
     # runner's own name here would leave the job queued forever, because no runner offers a label by
     # that name.
     runs-on: ubuntu-latest
-    # The two step-level timeouts below come to 40 minutes (20 build + 20 smoke); 55 leaves 15 on top
+    # The two step-level timeouts below come to 45 minutes (20 build + 25 smoke); 60 leaves 15 on top
     # for checkout, the tag computation and the two cleanup steps. The outer bound has to EXCEED the
     # sum, not equal it: act_runner kills the whole job when this fires, and a step marked
     # `if: always()` is not guaranteed to run afterwards — so a job that dies mid-smoke leaves
     # containers and a few hundred MB of image sitting on the daemon the entire fleet shares.
-    timeout-minutes: 55
+    timeout-minutes: 60
     # Job-level, so the smoke step and the cleanup step cannot disagree about it. The run id is what
     # keeps concurrent runs on this shared daemon from colliding — including this PR check running at
     # the same time as the publishing workflow — and ci/smoke.py refuses to start without this
@@ -55,10 +55,13 @@ jobs:
 
     - name: Compute image tags
       id: tags
-      # Byte-identical to the step of the same name in image-check-publish.yml, deliberately, even
-      # though this workflow never pushes: the tag it computes is what the build and the gate below
-      # name the image by, and a second, "simpler" version here would be a different rehearsal from
-      # the one that matters.
+      # The executable lines here are identical to those of the step of the same name in
+      # image-check-publish.yml, deliberately, even though this workflow never pushes: the tag it
+      # computes is what the build and the gate below name the image by, and a second, "simpler"
+      # version here would be a different rehearsal from the one that matters. The COMMENTS are not
+      # identical and are not meant to be — the publishing workflow has more to explain about the
+      # tags it actually pushes. ci/smoke.py enforces the part that matters: it reads both files and
+      # fails the gate if the duplicated steps stop running the same lines.
       # On a pull_request event `github.ref_name` is the merge ref (`123/merge`), which is neither
       # `master` nor `main` — so this always takes the sanitising branch below and can never produce
       # :latest.
@@ -141,17 +144,19 @@ jobs:
       # `python3` is present in the runner's job image `docker.gitea.com/runner-images:ubuntu-latest`;
       # note that a bare `python` is NOT, which is why the command below spells out python3.
       #
-      # 20 minutes, against ci/smoke.py's own worst case of roughly 13 if every docker call it makes
-      # runs out its bound. Being killed BY this timeout is what the margin is for: the script's own
-      # container cleanup would not run, and the `if: always()` step below catches that.
-      timeout-minutes: 20
+      # 25 minutes, against ci/smoke.py's own worst case of 18 if every docker call it makes runs
+      # out its bound — the arithmetic is written out over the bounds block in that file, and the
+      # two numbers are meant to be revisited together. Being killed BY this timeout is what the
+      # margin is for: the script's own container cleanup would not run, and the `if: always()`
+      # step below catches that.
+      timeout-minutes: 25
       env:
         SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
-      # The body of this step is byte-identical to the one in image-check-publish.yml. Only the
-      # `env:` value above differs. The PR gate and the publishing gate must run the same checks
-      # against the same kind of image, and the cheapest way to guarantee that is for the two to be
-      # literally the same text — anything else drifts, and it drifts silently, in the direction of
-      # the PR gate testing less.
+      # The executable lines of this step are identical to those of the step of the same name in
+      # image-check-publish.yml; only the `env:` value above differs, and the comments differ
+      # freely. The PR gate and the publishing gate must run the same checks against the same kind
+      # of image — anything else drifts, silently, in the direction of the PR gate testing less.
+      # ci/smoke.py compares the two files itself and fails the gate when they stop agreeing.
       run: |
         python3 ci/smoke.py
 
