@@ -1,0 +1,185 @@
+name: PR checks
+
+# The pull-request half of the pair. It builds the IDENTICAL image and runs the IDENTICAL smoke gate
+# as image-check-publish.yml — and then throws the image away. It never logs in to a registry, it has
+# no push step and it reads no secret at all, which is the entire point of splitting the two files.
+#
+# The workflow this replaces — .github/workflows/ghcr-check-publish.yml — did have a `pull_request`
+# trigger, but it pointed at the same single job that published: the PR path ran `docker login` with
+# the registry PAT and then pushed, off a branch, straight over the `:latest` production follows.
+# Splitting the two means a PR now gets the whole pipeline — image, gate — with no credential
+# anywhere in the job that could publish it.
+#
+# Building the image here is the point, not a formality: this repository has NO TESTS, so everything
+# the gate proves — that the dependency set pip resolved actually imports, that every aiogram symbol
+# the source names still exists, that the handlers register, that the database migrations survive a
+# real legacy file, that the health probe fails when it should — can only be checked against an
+# artefact. The image is removed from the runner by the cleanup step at the end.
+on:
+  pull_request:
+
+permissions:
+  contents: read   # checkout
+
+# Cancelling IS on here, and that is the one deliberate difference from the publishing workflow's
+# concurrency block. A superseded PR check has no product: its image is deleted at the end of the job
+# and nothing downstream consumes it, so a run made obsolete by a new push to the same PR is pure
+# queue time on a runner the whole fleet shares. In the publishing workflow the same setting would
+# destroy something — the :<sha> image of the commit being built, the only rollback point for it —
+# which is why it is false there and true here.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # `ubuntu-latest` is a LABEL, not a machine: the instance-level runner registered in Gitea
+    # (cirunner-hatbox) advertises it and serves every repository on the instance. Writing the
+    # runner's own name here would leave the job queued forever, because no runner offers a label by
+    # that name.
+    runs-on: ubuntu-latest
+    # The two step-level timeouts below come to 40 minutes (20 build + 20 smoke); 55 leaves 15 on top
+    # for checkout, the tag computation and the two cleanup steps. The outer bound has to EXCEED the
+    # sum, not equal it: act_runner kills the whole job when this fires, and a step marked
+    # `if: always()` is not guaranteed to run afterwards — so a job that dies mid-smoke leaves
+    # containers and a few hundred MB of image sitting on the daemon the entire fleet shares.
+    timeout-minutes: 55
+    # Job-level, so the smoke step and the cleanup step cannot disagree about it. The run id is what
+    # keeps concurrent runs on this shared daemon from colliding — including this PR check running at
+    # the same time as the publishing workflow — and ci/smoke.py refuses to start without this
+    # variable rather than falling back to a constant.
+    env:
+      SMOKE_NAME: health-tracker-smoke-${{ github.run_id }}
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Compute image tags
+      id: tags
+      # Byte-identical to the step of the same name in image-check-publish.yml, deliberately, even
+      # though this workflow never pushes: the tag it computes is what the build and the gate below
+      # name the image by, and a second, "simpler" version here would be a different rehearsal from
+      # the one that matters.
+      # On a pull_request event `github.ref_name` is the merge ref (`123/merge`), which is neither
+      # `master` nor `main` — so this always takes the sanitising branch below and can never produce
+      # :latest.
+      env:
+        # Passed through the environment instead of being interpolated into the script text: git
+        # allows `$`, backticks, quotes and parentheses in branch names, so a branch like
+        # `feat/$(id)` would otherwise execute on the runner, which is self-hosted and shared with
+        # every other repository on the instance.
+        REF_NAME: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ github.sha }}
+      run: |
+        # Gitea allows uppercase letters in repository names, docker does not accept them in an image
+        # path — so lowercase it here. Owner and name both come from $REPO, which keeps this file
+        # free of a hand-written path that could drift from where the repo actually lives; on this
+        # instance it resolves to gitea.vvzvlad.xyz/projects/health_tracker.
+        #
+        # There is deliberately no `set -e` in this body: everything here is assignment and `echo`.
+        IMAGE="gitea.vvzvlad.xyz/$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+        if [ "$REF_NAME" = "master" ] || [ "$REF_NAME" = "main" ]; then
+          # Tag ORDER matters and must not be "tidied up": the push step of the publishing workflow
+          # iterates over $TAGS left to right, so :latest is pushed LAST and acts as the commit of
+          # the whole publication.
+          echo "tags=$IMAGE:$SHA $IMAGE:latest" >> "$GITHUB_OUTPUT"
+          # The smoke gate needs ONE unambiguous tag out of the list above, and :<sha> is it.
+          echo "smoke=$IMAGE:$SHA" >> "$GITHUB_OUTPUT"
+        else
+          # Sanitise the branch name into a legal docker tag: everything outside [A-Za-z0-9_.-] (a
+          # `/` in feat/foo above all) becomes `-`, and the result is cut to 100 chars — branch names
+          # have no length limit, docker rejects tags over 128. The `sed` fixes the first character:
+          # docker requires a tag to match [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}, so a branch like `-fix`
+          # or `(test)` would otherwise produce a leading `-` and fail the build with `invalid
+          # reference format`.
+          branch_tag=$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | sed 's/^[^A-Za-z0-9_]/_/' | cut -c1-100)
+          # The sanitiser passes a name through untouched when it already consists of legal
+          # characters, so a branch literally named `latest` would come out as the production tag.
+          if [ "$branch_tag" = "latest" ]; then
+            branch_tag="branch-latest"
+          fi
+          echo "tags=$IMAGE:${branch_tag}" >> "$GITHUB_OUTPUT"
+          echo "smoke=$IMAGE:${branch_tag}" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Build the Docker image
+      # Step-level `timeout-minutes` is the one known to be enforced by Gitea's act_runner; the
+      # job-level one above is only the outer bound. 20 minutes covers a realistic cold build: one
+      # `pip install` of a small, fully pinned wheel set on top of python:3.11-slim.
+      timeout-minutes: 20
+      env:
+        # Through the environment, not interpolated into the script text: the only thing standing
+        # between a branch name and command execution on the runner is the `tr` filter in the step
+        # above. `$TAGS` below is intentionally unquoted — the tags are a space-separated list and
+        # word splitting is exactly what turns it into loop items.
+        TAGS: ${{ steps.tags.outputs.tags }}
+      run: |
+        set -e
+        # Split first, then count what the loop will actually iterate over — `[ -n "$TAGS" ]` would
+        # test the raw string BEFORE word splitting, so a value of nothing but whitespace would pass
+        # and still build an image with no `--tag` at all.
+        set -- $TAGS
+        [ "$#" -gt 0 ] || { echo "No tags to build: the tag-computation step produced no usable output. Refusing to build an image that nothing could name, push or remove." >&2; exit 1; }
+        tag_args=""
+        for tag in "$@"; do tag_args="$tag_args --tag $tag"; done
+        # --pull is required here: unlike GitHub's ephemeral runners, this one is self-hosted with a
+        # persistent docker daemon, so without the flag a once-pulled python:3.11-slim would sit in
+        # its cache for months and every build would inherit an unpatched base layer.
+        docker build --pull . --file Dockerfile $tag_args
+
+    - name: Smoke-test the built image
+      # THE GATE, run here on exactly the artefact a merge would later publish. This workflow is the
+      # only place a change gets to fail BEFORE it is on the default branch, and by then the
+      # publishing workflow's own gate is the last line rather than the first.
+      #
+      # READ THE MODULE DOCSTRING IN ci/smoke.py BEFORE CHANGING THE CHECKS. Two things there are not
+      # guessable from this file: NOTHING IS BIND-MOUNTED and NO PORT IS PUBLISHED (this job's
+      # filesystem and loopback are not the daemon's), which is why the probe is fed to the container
+      # ON STDIN; and every container the gate starts runs with `--network none`, which is what lets
+      # a PR from anywhere boot the real image with a fake token without ever reaching Telegram.
+      #
+      # `python3` is present in the runner's job image `docker.gitea.com/runner-images:ubuntu-latest`;
+      # note that a bare `python` is NOT, which is why the command below spells out python3.
+      #
+      # 20 minutes, against ci/smoke.py's own worst case of roughly 13 if every docker call it makes
+      # runs out its bound. Being killed BY this timeout is what the margin is for: the script's own
+      # container cleanup would not run, and the `if: always()` step below catches that.
+      timeout-minutes: 20
+      env:
+        SMOKE_IMAGE: ${{ steps.tags.outputs.smoke }}
+      # The body of this step is byte-identical to the one in image-check-publish.yml. Only the
+      # `env:` value above differs. The PR gate and the publishing gate must run the same checks
+      # against the same kind of image, and the cheapest way to guarantee that is for the two to be
+      # literally the same text — anything else drifts, and it drifts silently, in the direction of
+      # the PR gate testing less.
+      run: |
+        python3 ci/smoke.py
+
+    - name: Remove the smoke containers from the runner
+      # `always()`, and before the image cleanup below: this runner has one persistent docker daemon
+      # shared by every repository, so a container left behind by a failed run would sit there
+      # forever — and would also pin the image, making the `docker rmi` in the next step fail.
+      # ci/smoke.py removes its own containers itself, so on a normal run this is a no-op. It exists
+      # for the run where a step was killed by its own timeout and never reached any of that, which
+      # on a PR check is the likelier case: this workflow cancels superseded runs.
+      if: always()
+      run: |
+        # The three suffixes ci/smoke.py uses, kept in step with ALL_SUFFIXES there. No `set -eu`
+        # here on purpose: this is best-effort cleanup, every removal already ends in `|| true`, and
+        # failing the step would turn a leftover container into a red job.
+        for suffix in -probe -boot-cloud -boot-local; do docker rm -f "$SMOKE_NAME$suffix" || true; done
+
+    - name: Remove the built images from the runner
+      # The image built by a PR check has no consumer at all once the gate has run, so this is not
+      # merely housekeeping — without it every push to every open PR would leave a few hundred MB on
+      # a daemon shared by the whole fleet. Only the tags THIS run created are removed: no
+      # `docker system prune`, which would also wipe the images of every other repo on the same
+      # daemon, including ones other jobs are mid-run against.
+      # `always()` so the cleanup runs even when the smoke above fails.
+      if: always()
+      env:
+        TAGS: ${{ steps.tags.outputs.tags }}
+      run: |
+        # An empty $TAGS is legitimate HERE and is deliberately not rejected, unlike in the build
+        # step above: removing nothing when there is nothing to remove is the correct outcome.
+        for tag in $TAGS; do docker rmi "$tag" || true; done
