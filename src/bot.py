@@ -4,6 +4,8 @@ import re
 from datetime import datetime, timezone as dt_timezone
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -93,10 +95,45 @@ def _build_edit_field_keyboard(metric_id: int) -> InlineKeyboardMarkup:
 class HealthBot:
     def __init__(self, db: Database):
         self.db = db
-        bot_kwargs = {"token": settings.telegram_bot_token}
         if settings.telegram_api_server:
-            bot_kwargs["base_url"] = settings.telegram_api_server
-        self.bot = Bot(**bot_kwargs)
+            # The local Bot API server is configured on the SESSION, not on Bot(). aiogram 3
+            # takes only (token, session, default, **kwargs) and does nothing at all with
+            # anything else it is handed: the `base_url=` this line used to pass was
+            # accepted and dropped on the floor, so the bot kept talking to the cloud even
+            # on the day the variable did reach the process. Two silent failures stacked on
+            # each other — the environment name never arrived (see src/settings.py), and the
+            # value would not have been used if it had.
+            #
+            # is_local is deliberately left at its default False. It tells aiogram that
+            # files named in API responses are readable on this process's own filesystem,
+            # and they are not: the local Bot API server runs as its own container on a
+            # different host from this bot. Nothing here downloads files today, so the flag
+            # only stands to be wrong later.
+            session = AiohttpSession(
+                api=TelegramAPIServer.from_base(settings.telegram_api_server)
+            )
+            self.bot = Bot(token=settings.telegram_bot_token, session=session)
+            # The address is not a secret and is logged on purpose, so that a failure of this
+            # class stops being silent: a stack that passes TELEGRAM_BOT_API_SERVER and a bot
+            # that ignores it produced exactly the same log until somebody opened a python
+            # shell inside the container.
+            #
+            # The TOKEN is a secret, and it is not in this line — but that is a property of
+            # THIS line only and must not be read as "the token never reaches the log". It
+            # can: a Telegram request URL carries the token in its path, so a library that
+            # quotes a request URL in an error quotes the token with it, which is what
+            # aiohttp does for a URL with no scheme. What keeps it out of the log lives
+            # elsewhere and is stated where it is implemented — src/settings.py rejects a
+            # schemeless server address before any request is built, and
+            # src/logging_setup.py scrubs the token out of everything this process writes to
+            # stderr, tracebacks included.
+            logger.info("Bot API endpoint: local server {}", settings.telegram_api_server)
+        else:
+            self.bot = Bot(token=settings.telegram_bot_token)
+            logger.info(
+                "Bot API endpoint: cloud default api.telegram.org "
+                "(neither TELEGRAM_BOT_API_SERVER nor TELEGRAM_API_SERVER is set)"
+            )
         self.dp = Dispatcher(storage=MemoryStorage())
 
         router = Router()
@@ -125,7 +162,38 @@ class HealthBot:
 
         self.dp.include_router(router)
 
-    async def start(self):
+    async def contact_api(self):
+        """The FIRST Bot API request, split out of start() so that main.py can put it BEFORE the
+        scheduler — i.e. before the liveness mark exists.
+
+        It does one useful thing (registers the command menu) and one structural thing, and the
+        structural one is why it is its own method: returning from it is proof that this process
+        reached its Bot API and was accepted by it. Everything that grades the container as
+        healthy happens after it.
+
+        THE ORDER IS THE POINT, and it fixes a real hole rather than a theoretical one. While
+        this call lived inside start(), below scheduler.start(), a container pointed at a Bot API
+        address that BLACK-HOLES traffic — a wrong IP in the right subnet, a closed port, a host
+        that is down, which is the ordinary way this variable gets written wrong on a LAN — had its
+        mark on disk a second or two after startup, so it was healthy at its first probe (~5 s) and
+        only died when aiogram's per-request timeout expired (DEFAULT_TIMEOUT = 60 s, one attempt,
+        no retry). That is a minute of `healthy` inside the ~120 s window Portainer's updater waits,
+        so the broken image was accepted, and with `restart: unless-stopped` it went on being
+        accepted forever. Fast failures (refused connection, NXDOMAIN, a 401) always died before
+        the first probe; only the slow ones got through, and the slow ones are the common ones.
+
+        WHAT IT COSTS, since `healthy` now waits for a network round trip: worked out in full over
+        the HEALTHCHECK line in the Dockerfile, against a probe schedule measured on the production
+        daemon rather than assumed. The short of it — with the Bot API answering in milliseconds
+        NOTHING MOVES, because the mark is on disk before the first probe at ~5 s. A slower answer
+        only moves `healthy` along the 5 s cadence docker probes at while the start period runs: a
+        10 s request puts the mark at ~12 s and `healthy` at the +15 s probe instead of the +5 s
+        one. ~28 s is the threshold for something else entirely, and it is the one worth keeping —
+        past it the mark falls OUTSIDE the start period, so the next probe to see it is the +60 s
+        one; that, and not any shift at all, is what the updater's window is at risk from. The
+        request cannot exceed 60 s without raising, and the worst SUCCESSFUL start is still about
+        30 s inside that window.
+        """
         await self.bot.set_my_commands([
             BotCommand(command="start", description="Show help"),
             BotCommand(command="add", description="Add a new metric"),
@@ -136,7 +204,23 @@ class HealthBot:
             BotCommand(command="export", description="Download CSV export"),
             BotCommand(command="timezone", description="Set your timezone (±HH:MM)"),
         ])
+
+    async def start(self):
+        """Poll, and nothing else. contact_api() must have run first; main.py is what guarantees
+        the order and the in-image probe checks that it still does."""
         await self.dp.start_polling(self.bot)
+
+    async def close(self):
+        """Release the HTTP session. Idempotent, and called from main.py's `finally` on every path.
+
+        start_polling() closes the session itself when it returns, so on the normal path this is a
+        no-op — aiogram's AiohttpSession.close() returns at once for a session that is already
+        closed, or was never opened. It exists for the paths where polling never began: a
+        contact_api() that raised, or a startup heartbeat that could not be written. Without it
+        those paths end with aiohttp's "Unclosed client session" printed after the traceback that
+        actually explains the failure.
+        """
+        await self.bot.session.close()
 
     async def send_reminder(self, user_id: int, metric: dict) -> None:
         history = await self.db.get_last_records(metric["id"])
