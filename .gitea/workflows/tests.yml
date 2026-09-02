@@ -33,10 +33,10 @@ concurrency:
 
 jobs:
   build:
-    # `ubuntu-latest` is a LABEL, not a machine: the instance-level runner registered in Gitea
-    # (cirunner-hatbox) advertises it and serves every repository on the instance. Writing the
-    # runner's own name here would leave the job queued forever, because no runner offers a label by
-    # that name.
+    # `ubuntu-latest` is a LABEL, not a machine: the instance-level self-hosted runner
+    # registered in Gitea advertises it and serves every repository on the instance. Writing
+    # the runner's own name here would leave the job queued forever, because no runner offers
+    # a label by that name.
     runs-on: ubuntu-latest
     # The two step-level timeouts below come to 50 minutes (20 build + 30 smoke); 65 leaves 15 on top
     # for checkout, the tag computation and the two cleanup steps. The outer bound has to EXCEED the

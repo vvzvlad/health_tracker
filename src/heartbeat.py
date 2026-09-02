@@ -29,20 +29,21 @@ import time
 # /tmp is in the container's own writable layer, and the daemon creates that layer EMPTY when it
 # CREATES a container. An updater REPLACES the container, so the mark cannot cross from the
 # retired one to its replacement — that whole scenario is closed by the location alone.
-# (Two claims there, both verified on nebula — Docker 27.1.1, the version production runs — and
-# the second one is narrower than it is usually written: it is the LAYER that is empty. `/tmp` as
-# seen inside the container is that layer over the image's own /tmp, so an image shipping files in
-# /tmp would show them. python:3.x-slim was checked and ships an empty /tmp, which is why the two
-# coincide here — but that is a property of the base image, not a law.)
+# (Two claims there, both verified on the production host — Docker 27.1.1, the version it runs —
+# and the second one is narrower than it is usually written: it is the LAYER that is empty. `/tmp`
+# as seen inside the container is that layer over the image's own /tmp, so an image shipping files
+# in /tmp would show them. python:3.x-slim was checked and ships an empty /tmp, which is why the
+# two coincide here — but that is a property of the base image, not a law.)
 #
 # WHAT THE LOCATION DOES NOT COVER, and this is the half that gets forgotten: the layer survives
 # a RESTART of the same container. `docker restart`, `restart: unless-stopped` after the process
 # dies, `docker stop && docker start`, a host reboot — all of them start a new process over the
 # SAME writable layer, with the previous run's mark still in it, at most HEARTBEAT_INTERVAL old.
-# Docker resets the health state to `starting` on a restart (verified on nebula, 27.1.1), so the new run is
-# graded from scratch: its first probe reads that inherited mark, finds it fresh, and reports
-# healthy a process that is at that moment wedged in db.init(). clear_heartbeat(), called from
-# main.py before anything that can block, is what closes THAT — see its docstring.
+# Docker resets the health state to `starting` on a restart (verified on the production host,
+# 27.1.1), so the new run is graded from scratch: its first probe reads that inherited mark, finds
+# it fresh, and reports healthy a process that is at that moment wedged in db.init().
+# clear_heartbeat(), called from main.py before anything that can block, is what closes THAT — see
+# its docstring.
 #
 # So do not move this next to the database to keep it "with the data". The mark is not data:
 # it is worth nothing a second after the process that wrote it stopped, it must not outlive the

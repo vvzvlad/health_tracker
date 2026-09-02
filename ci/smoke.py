@@ -197,8 +197,8 @@ DUPLICATED_STEPS = ("Compute image tags", "Smoke-test the built image")
 FAKE_TOKEN = "123456789:AAFakeTokenUsedOnlyByTheSmokeGate0000"
 # The address handed to the SERVED boot, and it is a real address there rather than a placeholder:
 # a stub Bot API server runs on that port inside that same container. Loopback is available under
-# `--network none` (the namespace has an `lo` interface and it is UP — verified on nebula, Docker
-# 27.1.1, the version production runs),
+# `--network none` (the namespace has an `lo` interface and it is UP — verified on the production
+# host, Docker 27.1.1, the version it runs),
 # so this reaches the stub and nothing else, which keeps the "no container here can reach Telegram"
 # guarantee exactly as strong as it was. The scheme is not decoration: src/settings.py rejects a
 # bare host:port, so an address written without one would fail the boot rather than exercise the
@@ -2148,8 +2148,8 @@ def check_boot_served(image, name):
     Everything below the endpoint rows is only reachable because the request succeeded, which is
     the point: it is the proof that a GOOD image still gets all the way to a mark under the new
     call order. The stub is on 127.0.0.1 inside this same container — loopback exists and is up
-    under `--network none` (verified on nebula, Docker 27.1.1) — so nothing here can reach Telegram any
-    more than the other containers can.
+    under `--network none` (verified on the production host, Docker 27.1.1) — so nothing here can
+    reach Telegram any more than the other containers can.
 
     It also carries the end-to-end half of the endpoint regression test: the probe checks that the
     SESSION points at the configured server; this checks that TELEGRAM_BOT_API_SERVER, spelled the

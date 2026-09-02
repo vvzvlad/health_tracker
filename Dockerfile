@@ -62,15 +62,15 @@ RUN mkdir -p data
 # THE TIMINGS ARE LOAD-BEARING, not taste. Portainer's updater waits roughly 120 s for a freshly
 # deployed container to report `healthy` and rolls the image back if it does not, so what these
 # four numbers really decide is whether an automatic update sticks.
-#   * THE PROBE SCHEDULE, measured on nebula — Docker 27.1.1, the version production runs — with
-#     exactly the four numbers below and a check that always fails, read out of the container's own
-#     State.Health.Log: probes at +20.3, +25.4, +30.4, +60.5, +90.5 s. Those five are the LAST five
-#     and five is ALL THERE IS — docker keeps only the five most recent entries in that log, so the
-#     probes at +5, +10 and +15 s had already been pushed out of it by the time it was read. The
-#     first probe is therefore measured separately, by inspecting a container before the eviction:
-#     +5.2 s. (Both re-measured on the same host while this paragraph was corrected: probes at
-#     +5.2, +10.2, +15.3, +20.3, +25.4, +30.5, +60.5, +90.6 s, with the log stuck at five entries
-#     from the sixth probe onwards.) Read that as: docker probes every
+#   * THE PROBE SCHEDULE, measured on the production host — Docker 27.1.1, the version it runs —
+#     with exactly the four numbers below and a check that always fails, read out of the
+#     container's own State.Health.Log: probes at +20.3, +25.4, +30.4, +60.5, +90.5 s. Those five
+#     are the LAST five and five is ALL THERE IS — docker keeps only the five most recent entries
+#     in that log, so the probes at +5, +10 and +15 s had already been pushed out of it by the time
+#     it was read. The first probe is therefore measured separately, by inspecting a container
+#     before the eviction: +5.2 s. (Both re-measured on the same host while this paragraph was
+#     corrected: probes at +5.2, +10.2, +15.3, +20.3, +25.4, +30.5, +60.5, +90.6 s, with the log
+#     stuck at five entries from the sixth probe onwards.) Read that as: docker probes every
 #     --start-interval WHILE --start-period is running (5 s, the documented default since Docker
 #     25, and it applies WITHOUT the flag being declared — a container given an explicit
 #     --health-start-interval=5s first-probed at +5.3 s against +5.2 s without it, i.e. no
@@ -99,13 +99,13 @@ RUN mkdir -p data
 #     arithmetic that follows from it — --start-period + --retries x --interval = 120 s — is
 #     wrong by a whole --interval: the streak starts at the BOUNDARY probe itself, not one full
 #     --interval after the start period ends. The 5 s grid crosses 30 s and its first probe past
-#     the boundary already counts. Measured on nebula (Docker 27.1.1, always-failing probe): the
-#     streak reads 0 at +26 s, 1 at the +30.5 s probe, 2 at +62 s, and 3 with the `unhealthy`
-#     verdict at +90.6 s. The sub-second offset is not what buys the 30 s — it only guarantees
-#     that the boundary probe lands after 30.0 s rather than on it, and it can only grow, since
-#     docker waits --start-interval after each probe FINISHES. So the verdict lands ~30 s INSIDE
-#     the updater's window, not level with it. The rollback does not depend on this either way:
-#     it fires because `healthy` never arrived, not because `unhealthy` did.
+#     the boundary already counts. Measured on the production host (Docker 27.1.1, always-failing
+#     probe): the streak reads 0 at +26 s, 1 at the +30.5 s probe, 2 at +62 s, and 3 with the
+#     `unhealthy` verdict at +90.6 s. The sub-second offset is not what buys the 30 s — it only
+#     guarantees that the boundary probe lands after 30.0 s rather than on it, and it can only
+#     grow, since docker waits --start-interval after each probe FINISHES. So the verdict lands
+#     ~30 s INSIDE the updater's window, not level with it. The rollback does not depend on this
+#     either way: it fires because `healthy` never arrived, not because `unhealthy` did.
 #   * A container that WAS healthy and then wedges is caught by two numbers that MULTIPLY
 #     rather than add: the mark has to go stale first (HEARTBEAT_MAX_AGE = 90 s, three missed
 #     ticks of the 30 s job) and only then must three consecutive --interval probes fail. That
