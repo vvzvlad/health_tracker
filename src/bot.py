@@ -95,7 +95,7 @@ def _build_edit_field_keyboard(metric_id: int) -> InlineKeyboardMarkup:
 class HealthBot:
     def __init__(self, db: Database):
         self.db = db
-        if settings.telegram_api_server:
+        if settings.telegram_bot_api_server:
             # The local Bot API server is configured on the SESSION, not on Bot(). aiogram 3
             # takes only (token, session, default, **kwargs) and does nothing at all with
             # anything else it is handed: the `base_url=` this line used to pass was
@@ -110,7 +110,7 @@ class HealthBot:
             # different host from this bot. Nothing here downloads files today, so the flag
             # only stands to be wrong later.
             session = AiohttpSession(
-                api=TelegramAPIServer.from_base(settings.telegram_api_server)
+                api=TelegramAPIServer.from_base(settings.telegram_bot_api_server)
             )
             self.bot = Bot(token=settings.telegram_bot_token, session=session)
             # The address is not a secret and is logged on purpose, so that a failure of this
@@ -127,12 +127,12 @@ class HealthBot:
             # schemeless server address before any request is built, and
             # src/logging_setup.py scrubs the token out of everything this process writes to
             # stderr, tracebacks included.
-            logger.info("Bot API endpoint: local server {}", settings.telegram_api_server)
+            logger.info("Bot API endpoint: local server {}", settings.telegram_bot_api_server)
         else:
             self.bot = Bot(token=settings.telegram_bot_token)
             logger.info(
                 "Bot API endpoint: cloud default api.telegram.org "
-                "(neither TELEGRAM_BOT_API_SERVER nor TELEGRAM_API_SERVER is set)"
+                "(TELEGRAM_BOT_API_SERVER is not set)"
             )
         self.dp = Dispatcher(storage=MemoryStorage())
 

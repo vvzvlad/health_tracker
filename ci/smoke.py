@@ -100,9 +100,9 @@ THE CHECKS
       "not set" rather than raising at import, which is what a variable declared and left blank in a
       stack really produces. LOG_LEVEL gets the same treatment for the same reason — a lowercase or
       blank value must not raise inside configure_logging(), which runs before there is a sink or an
-      excepthook to report it through. Both accepted names for the server resolve to the same value,
-      with the park's convention winning when both are set. And the log redaction removes a token
-      from text while leaving text alone when the "token" is too short to be one. Probe.
+      excepthook to report it through. The server address is read from the park's convention name,
+      TELEGRAM_BOT_API_SERVER. And the log redaction removes a token from text while leaving text
+      alone when the "token" is too short to be one. Probe.
 * (k) the two workflows really do run the same lines in the steps that claim to be duplicates of
       each other. This is the only check here about the CI files rather than the image, and it is
       here because the claim is otherwise unenforceable: the PR gate and the publishing gate drift
@@ -247,10 +247,10 @@ PROBE_ROW_PREFIX = "[in-image] "
 # The number of verdicts the probe is supposed to print. Compared EXACTLY rather than "at least",
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
-# 9 modules + 27 imported symbols + 12 methods called on them + 6 handler registration
+# 9 modules + 25 imported symbols + 12 methods called on them + 6 handler registration
 # + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 11 health probe
-# + 1 empty-token startup + 11 settings + 2 logging bridge.
-EXPECTED_PROBE_TARGETS = 103
+# + 1 empty-token startup + 9 settings + 2 logging bridge.
+EXPECTED_PROBE_TARGETS = 99
 
 # The total this gate produces when everything runs: 24 of its own (8 contract + 2 workflow parity +
 # 6 cloud boot + 8 served boot) + the probe's rows + the two consistency rows run_probe() adds about
@@ -390,8 +390,6 @@ SYMBOLS = [
     ("aiosqlite", "Row"),
     ("aiosqlite", "IntegrityError"),
     ("loguru", "logger"),
-    ("pydantic", "AliasChoices"),
-    ("pydantic", "Field"),
     ("pydantic", "field_validator"),
     ("pydantic_settings", "BaseSettings"),
     ("pydantic_settings", "SettingsConfigDict"),
@@ -428,12 +426,10 @@ EXPECTED_CALLBACK_HANDLERS = {
     "_cb_pick_metric", "_cb_record", "_cb_edit_pick", "_cb_edit_field", "_cb_edit_back",
 }
 
-# The two environment names that mean the same setting, and the value each is given so the probe can
-# tell which one won when both are present.
+# The environment name the Bot API server address is read from (the park's convention), and the
+# value the probe gives it.
 CONVENTION_NAME = "TELEGRAM_BOT_API_SERVER"
-LEGACY_NAME = "TELEGRAM_API_SERVER"
 CONVENTION_URL = "http://convention.invalid:8081"
-LEGACY_URL = "http://legacy.invalid:8081"
 
 # The schema as it was BEFORE the two migrations in src/database.py: `metrics` without a description
 # column, and `records` with the CHECK constraint that only allowed 0..5. This is what a production
@@ -517,10 +513,9 @@ def build_bot(workdir, api_server=None):
     import src.settings
     from src.database import Database
 
-    saved = {name: os.environ.get(name) for name in (CONVENTION_NAME, LEGACY_NAME)}
+    saved = os.environ.get(CONVENTION_NAME)
     try:
-        for name in (CONVENTION_NAME, LEGACY_NAME):
-            os.environ.pop(name, None)
+        os.environ.pop(CONVENTION_NAME, None)
         if api_server is not None:
             os.environ[CONVENTION_NAME] = api_server
         patched = src.settings.Settings()
@@ -532,11 +527,10 @@ def build_bot(workdir, api_server=None):
         finally:
             src.bot.settings = original
     finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        if saved is None:
+            os.environ.pop(CONVENTION_NAME, None)
+        else:
+            os.environ[CONVENTION_NAME] = saved
 
 
 def check_handlers(workdir):
@@ -603,9 +597,9 @@ def check_api_endpoint(workdir):
     Read the SESSION, not the setting. The previous code read the setting perfectly well once its
     name was right and still talked to the cloud, because it passed the value to `Bot(base_url=...)`
     - and aiogram 3 takes (token, session, default, **kwargs) and silently discards everything else.
-    A check that asserted "settings.telegram_api_server == the URL" would have been green on exactly
-    the code that was broken. `session.api.base` is the value that decides where a request really
-    goes, so it is the value this asks about.
+    A check that asserted "settings.telegram_bot_api_server == the URL" would have been green on
+    exactly the code that was broken. `session.api.base` is the value that decides where a request
+    really goes, so it is the value this asks about.
     """
     target = "with no server configured the bot really uses api.telegram.org"
     try:
@@ -672,21 +666,19 @@ def check_api_endpoint(workdir):
 
 
 def settings_from_env(**overrides):
-    """Build a fresh Settings with the two API-server names forced to a known state."""
+    """Build a fresh Settings with the API-server name forced to a known state."""
     import src.settings
-    saved = {name: os.environ.get(name) for name in (CONVENTION_NAME, LEGACY_NAME)}
+    saved = os.environ.get(CONVENTION_NAME)
     try:
-        for name in (CONVENTION_NAME, LEGACY_NAME):
-            os.environ.pop(name, None)
+        os.environ.pop(CONVENTION_NAME, None)
         for name, value in overrides.items():
             os.environ[name] = value
         return src.settings.Settings()
     finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        if saved is None:
+            os.environ.pop(CONVENTION_NAME, None)
+        else:
+            os.environ[CONVENTION_NAME] = saved
 
 
 def settings_with_log_level(value):
@@ -704,7 +696,7 @@ def settings_with_log_level(value):
 
 
 def check_settings():
-    """(j) The guard, and the two accepted names for one setting."""
+    """(j) The guard, and the name the Bot API server address is read from."""
     target = "a missing TELEGRAM_BOT_TOKEN fails the process with a message naming the field"
     try:
         env = dict(os.environ)
@@ -728,15 +720,11 @@ def check_settings():
     cases = [
         ("the park convention name {} is read".format(CONVENTION_NAME),
          {CONVENTION_NAME: CONVENTION_URL}, CONVENTION_URL),
-        ("the legacy name {} is still accepted".format(LEGACY_NAME),
-         {LEGACY_NAME: LEGACY_URL}, LEGACY_URL),
-        ("with both set, {} wins".format(CONVENTION_NAME),
-         {CONVENTION_NAME: CONVENTION_URL, LEGACY_NAME: LEGACY_URL}, CONVENTION_URL),
-        ("with neither set the value is None", {}, None),
+        ("with {} not set the value is None".format(CONVENTION_NAME), {}, None),
     ]
     for target, overrides, expected in cases:
         try:
-            value = settings_from_env(**overrides).telegram_api_server
+            value = settings_from_env(**overrides).telegram_bot_api_server
             if value == expected:
                 record(target)
             else:
@@ -755,7 +743,7 @@ def check_settings():
     try:
         problems = []
         for spelling in ("", "   "):
-            value = settings_from_env(**{CONVENTION_NAME: spelling}).telegram_api_server
+            value = settings_from_env(**{CONVENTION_NAME: spelling}).telegram_bot_api_server
             if value is not None:
                 problems.append("{!r} became {!r} instead of None".format(spelling, value))
         if problems:
@@ -1571,8 +1559,7 @@ def check_empty_token_startup(workdir):
         # staged at the default path nor touch any database they built.
         env["DATABASE_PATH"] = os.path.join(directory, "health.db")
         env["HEARTBEAT_FILE"] = os.path.join(directory, "heartbeat")
-        for name in (CONVENTION_NAME, LEGACY_NAME):
-            env.pop(name, None)
+        env.pop(CONVENTION_NAME, None)
         completed = subprocess.run(
             [sys.executable, "main.py"],
             cwd="/app", env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -2453,13 +2440,13 @@ def main():
 
     # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
     # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 126/126` — three short of the 129 below, and indistinguishable
+    # so the run would end `smoke ok: 122/122` — three short of the 125 below, and indistinguishable
     # from a good run to anybody not counting — exit 0, and have every printed row saying ok with
     # several claims silently no longer made.
     #
     # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
     # failing check legitimately reports fewer rows than its happy path — run_probe emits 1 instead
-    # of the 105 (103 from the probe plus its 2 consistency rows) a green run produces, when its
+    # of the 101 (99 from the probe plus its 2 consistency rows) a green run produces, when its
     # container never started — so on an already-red run this row would fire too, on top of the real
     # failure, and read as though the GATE were broken. The fault it exists to catch is invisible on
     # a red run and decisive on a green one, which is exactly where it is reported.
