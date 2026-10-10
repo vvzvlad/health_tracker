@@ -119,10 +119,12 @@ async def main():
         # have skipped db.close(), putting the hang back, AND replaced the exception on its way out
         # — including the HeartbeatUnwritable line, which exists to be read.
         # Each step is isolated for the same reason; shutdown_step() explains it.
-        # The one cost of closing the database first: a reminder tick that fires in the gap before
-        # the scheduler stops finds a closed connection. check_reminders() catches that around its
-        # own query and logs it, which is a stray line in the log of a process that is dying
-        # anyway — cheap against a container that never exits.
+        # What closing the database first costs is the gap before the scheduler stops, in which
+        # both jobs can still fire. A reminder tick finds a closed connection; check_reminders()
+        # catches that around its own query and logs it, which is a stray line in the log of a
+        # process that is dying anyway. A heartbeat tick can write a fresh mark while the process
+        # is dying; the gap is short and the next start clears the mark before anything that can
+        # block (clear_heartbeat() above). Both are cheap against a container that never exits.
         await shutdown_step("close the database", db.close)
         if scheduler is not None:
             await shutdown_step("stop the scheduler", scheduler.stop)
