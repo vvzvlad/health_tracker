@@ -170,7 +170,9 @@ EXPECTED_HEALTHCHECK_TEST = ["CMD-SHELL", "python -m src.healthcheck || exit 1"]
 # container reaches it at its FIRST successful probe, about 5 s in — docker probes every
 # --start-interval (5 s, the default since Docker 25, applied whether or not the image declares it)
 # while --start-period runs, and every --interval afterwards. A container that never becomes
-# healthy is graded `unhealthy` only at --start-period + --retries x --interval = 120 s. A longer
+# healthy is graded `unhealthy` at about 90 s, NOT at the naive --start-period + --retries x
+# --interval = 120 s: the first probe that counts is the boundary one on the 5 s grid (+30.5 s),
+# and the verdict lands at +90.6 s (measured on the production host, Docker 27.1.1). A longer
 # interval — the natural "it is a stable service" edit — pushes both of those past the window and
 # makes every automatic update roll itself back while looking like a failing image. Pinned here so
 # that edit cannot land without this gate saying so.
@@ -246,9 +248,9 @@ PROBE_ROW_PREFIX = "[in-image] "
 # because the failure this catches is a probe that quietly stopped checking things: every line it
 # does print says ok and it exits 0, so nothing else in this file would notice.
 # 9 modules + 27 imported symbols + 12 methods called on them + 6 handler registration
-# + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 10 health probe
+# + 5 Bot API endpoint + 8 fresh database + 6 legacy migration + 5 scheduler + 11 health probe
 # + 1 empty-token startup + 11 settings + 2 logging bridge.
-EXPECTED_PROBE_TARGETS = 102
+EXPECTED_PROBE_TARGETS = 103
 
 # The total this gate produces when everything runs: 24 of its own (8 contract + 2 workflow parity +
 # 6 cloud boot + 8 served boot) + the probe's rows + the two consistency rows run_probe() adds about
@@ -285,10 +287,10 @@ COPY_TIMEOUT = 30
 WAIT_TIMEOUT = 90
 # 420, not 300. The probe runs subprocesses of its own and they are bounded too: five runs of
 # `python -m src.healthcheck` at HEALTHCHECK_RUN_TIMEOUT (30 s), one Settings import at 60 s and
-# one real main.py at MAIN_RUN_TIMEOUT (30 s) come to 240 s in the worst case, and the rest of the
+# one real main.py at MAIN_RUN_TIMEOUT (60 s) come to 270 s in the worst case, and the rest of the
 # probe — importing aiogram, building bots, migrating sqlite files — has to fit in what is left. At
 # 300 the outer bound could fire FIRST and replace a row-by-row report with a single "`docker run`
-# did not finish"; the outer bound must never pre-empt the report it is bounding. 420 leaves ~180 s
+# did not finish"; the outer bound must never pre-empt the report it is bounding. 420 leaves ~150 s
 # over the inner sum.
 PROBE_TIMEOUT = 420
 
@@ -298,7 +300,8 @@ PROBE_TIMEOUT = 420
 BOOT_BUDGET = 90
 BOOT_PAUSE = 0.5
 
-# Large enough to hold the probe's ENTIRE report (101 lines) plus a boot log with a traceback in it.
+# Large enough to hold the probe's ENTIRE report (one line per EXPECTED_PROBE_TARGETS row plus the
+# marker line) plus a boot log with a traceback in it.
 # 4000 was not: it cut the probe transcript mid-report, taking the marker line on its last row with
 # it — so the one row that says how many checks really ran became unreadable in the CI log at exactly
 # the moment somebody would be looking for it.
@@ -1165,8 +1168,12 @@ def check_scheduler(workdir):
 HEALTHCHECK_RUN_TIMEOUT = 30
 # And the single run of the REAL main.py in check_empty_token_startup gets this many. Unlike every
 # other bound here it is a verdict rather than a safety net: a startup still alive when it expires
-# IS the failure that check exists to find. Generous against the ~1 s a correct one takes.
-MAIN_RUN_TIMEOUT = 30
+# IS the failure that check exists to find - and its message asserts a diagnosis (that it hung
+# because nothing closed the aiosqlite connection) rather than "did not finish", so a bound a cold
+# or loaded runner can hit would be a false red with a confident wrong explanation. Hence 60 s, the same as the bare
+# Settings import in check_settings gets, for a run that also imports aiogram, apscheduler and
+# aiosqlite, opens the database and writes WAL - against the ~1 s a correct one takes.
+MAIN_RUN_TIMEOUT = 60
 # WORKDIR in the image, and the root of everything the Dockerfile copies in. The data volume is
 # mounted below it, which is why the default mark must be outside it altogether.
 APP_DIR_IN_IMAGE = "/app"
@@ -1416,6 +1423,40 @@ def check_health_probe(workdir):
     except Exception as error:
         fail_group(target, error)
 
+    target = "main.py's finally closes the database before it stops the scheduler or the bot"
+    # main.py calls the order of its `finally` load-bearing: an unclosed aiosqlite connection is
+    # what keeps the interpreter alive, so db.close() goes first. Source-order once more, but NOT
+    # through main_call_lines(): the steps are ARGUMENTS of shutdown_step(name, step) rather than
+    # calls, so they are not Call nodes and that helper cannot see them. The literal step names are
+    # read instead. It trusts those labels: it does not check that the "close the database" step
+    # really is db.close, and a bare call added above the steps is invisible to it. The empty-token
+    # row does not cover this either: there HealthBot(db) raises in its constructor, `bot` and
+    # `scheduler` stay None, and the `finally` shrinks to one step, so any order passes it.
+    try:
+        import main as main_module
+        with open(main_module.__file__) as handle:
+            tree = ast.parse(handle.read())
+        # ast.walk is breadth-first, not source order, hence the sort by line.
+        steps = [name for _, name in sorted(
+            (node.lineno, node.args[0].value) for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "shutdown_step" and node.args
+            and isinstance(node.args[0], ast.Constant))]
+        expected_steps = {"close the database", "stop the scheduler", "close the bot session"}
+        if set(steps) != expected_steps:
+            record(target, "main.py's shutdown_step() calls name {} rather than exactly {}. If a "
+                           "step was renamed, added or removed on purpose, update expected_steps "
+                           "here; until then this row cannot say which step runs "
+                           "first".format(steps, sorted(expected_steps)))
+        elif steps[0] == "close the database":
+            record(target)
+        else:
+            record(target, "the steps run in the order {}, so the database is no longer closed "
+                           "first - see the comment on main.py's `finally` for why that order "
+                           "decides whether the process can exit".format(steps))
+    except Exception as error:
+        fail_group(target, error)
+
     target = "the STARTUP mark write is loud where the periodic one is silent"
     # THE DIRECTION OF FAILURE THAT NOTHING ELSE HERE WOULD NOTICE. A container that cannot write
     # /tmp at all - a read-only root filesystem with no tmpfs, a volume mounted over /tmp, a full
@@ -1496,20 +1537,28 @@ def check_empty_token_startup(workdir):
     and left blank is exactly how an empty one is produced, since `telegram_bot_token: str` accepts
     the empty string and pydantic-settings does not read a blank variable as absent. Meanwhile
     db.init() has already opened an aiosqlite connection, which runs on a NON-daemon thread. If the
-    raise happens where nothing closes that connection - HealthBot(db) sitting ABOVE main.py's try,
-    which is where it used to sit - the interpreter cannot exit: measured, still alive 25 s after
-    the traceback.
+    raise happens where nothing closes that connection - HealthBot(db) sitting between db.init() and
+    main.py's try, which is where it used to sit when db.init() was outside the try as well - the
+    interpreter cannot exit: measured, still alive 25 s after the traceback.
 
     So this runs the REAL main.py, from this image, with an empty token and a bound, and the bound
-    is the verdict: a timeout here is the failure. The mutation it is here for is moving
-    `HealthBot(db)` and `ReminderScheduler(db, bot)` back outside that try.
+    is the verdict: a timeout here is the failure. What it pins is a PROPERTY, not one mutation: an
+    empty token must kill the process under ANY arrangement of main.py's lines. It does not, in
+    particular, catch the literal edit "move both constructors back outside the try" - moved above
+    the try they land above db.init() too, nothing is open yet, and the process dies cleanly, which
+    is a pass and is correct. It goes red on an arrangement that opens the database and then raises
+    where the `finally` does not close it.
 
     A MISSING token is a different question and has its own row in check_settings: it is refused by
     pydantic at `import src.settings`, before anything is open. This one is about a token that is
     present and empty, which pydantic accepts and aiogram does not.
 
     The reason for the death is checked too, loosely: a main.py that died of something else
-    entirely would otherwise satisfy "it exited" while proving nothing about the hang.
+    entirely would otherwise satisfy "it exited" while proving nothing about the hang. LOOSELY is
+    the honest word: the second accepted reason, "telegram_bot_token" in the output, is also what
+    a pydantic refusal at `import src.settings` prints. So if a validator ever rejects the empty
+    token at import, this row stays green while it no longer watches the path it is about -
+    aiogram refusing the token after the database is already open.
     """
     target = "an empty TELEGRAM_BOT_TOKEN kills the process instead of hanging it"
     directory = os.path.join(workdir, "empty-token")
@@ -1538,8 +1587,9 @@ def check_empty_token_startup(workdir):
             so_far = so_far.decode("utf-8", "replace")
         record(target, "it was still running {} s after it was started, so it HUNG rather than "
                        "died. The aiosqlite connection opened by db.init() is on a non-daemon "
-                       "thread and nothing closed it - which is what happens when the object that "
-                       "raises is constructed outside main.py's try. Output so far: {}".format(
+                       "thread and nothing closed it - which is what happens when something raises "
+                       "after db.init() and outside the try whose `finally` closes the database. "
+                       "Output so far: {}".format(
                            MAIN_RUN_TIMEOUT, so_far.strip()[-400:]))
         return
     except Exception as error:
@@ -1889,9 +1939,11 @@ def check_image_contract(image):
                 "it is {!r}, expected {!r}. These numbers decide, against the ~120 s the Portainer "
                 "updater waits before rolling the image back, both how fast a good container can "
                 "report healthy (its first probe, one --start-interval in, ~5 s) and how long a "
-                "bad one takes to be graded unhealthy (--start-period + --retries x --interval = "
-                "120 s, because failures inside the start period do not count towards the "
-                "retries)".format(actual, expected))))
+                "bad one takes to be graded unhealthy (~90 s with the expected values: the first "
+                "probe that counts towards the retries is the boundary one on the 5 s grid, "
+                "+30.5 s, and the verdict lands at +90.6 s, measured on the production host with Docker 27.1.1 "
+                "— not the naive --start-period + --retries x --interval = 120 s; see the "
+                "Dockerfile)".format(actual, expected))))
     return rows
 
 
@@ -2401,13 +2453,13 @@ def main():
 
     # Before a single verdict is printed: the NUMBER of verdicts is itself one. A check_* that
     # stopped emitting rows takes its own verdicts out of the report and takes nothing red with them,
-    # so the run would end `smoke ok: 125/125` — three short of the 128 below, and indistinguishable
+    # so the run would end `smoke ok: 126/126` — three short of the 129 below, and indistinguishable
     # from a good run to anybody not counting — exit 0, and have every printed row saying ok with
     # several claims silently no longer made.
     #
     # ONLY on a run where nothing else failed, and that is not laziness about the arithmetic. A
     # failing check legitimately reports fewer rows than its happy path — run_probe emits 1 instead
-    # of the 104 (102 from the probe plus its 2 consistency rows) a green run produces, when its
+    # of the 105 (103 from the probe plus its 2 consistency rows) a green run produces, when its
     # container never started — so on an already-red run this row would fire too, on top of the real
     # failure, and read as though the GATE were broken. The fault it exists to catch is invisible on
     # a red run and decisive on a green one, which is exactly where it is reported.
