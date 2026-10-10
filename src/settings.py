@@ -1,6 +1,6 @@
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from src.logging_setup import LOG_LEVELS
@@ -8,23 +8,11 @@ from src.logging_setup import LOG_LEVELS
 
 class Settings(BaseSettings):
     telegram_bot_token: str
-    # ONE setting, TWO accepted environment names, and the order is the whole point.
-    #
-    # TELEGRAM_BOT_API_SERVER is the name the `telegram_bots` stack really passes this
-    # container, and the name the neighbouring medical_bot in the same stack receives — the
-    # compose spelling is the park's convention. This field used to be declared as plain
-    # `telegram_api_server`, i.e. it read TELEGRAM_API_SERVER, and the divergence was on
-    # this side. With `extra="ignore"` below the mismatch cost nothing loudly: the variable
-    # the stack passed was dropped without a word, the field stayed None, and the bot went
-    # on talking to api.telegram.org while the line in the compose file looked like it was
-    # working.
-    #
-    # TELEGRAM_API_SERVER stays accepted, SECOND, so that a local .env written against the
-    # old name keeps working; it is consulted only when the convention name is absent.
-    telegram_api_server: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("TELEGRAM_BOT_API_SERVER", "TELEGRAM_API_SERVER"),
-    )
+    # Read from TELEGRAM_BOT_API_SERVER, the env name every bot in the park uses for the local
+    # Bot API server. This field once read a different name, and with `extra="ignore"` below
+    # the variable the stack really passed was dropped without a word, leaving the bot on
+    # api.telegram.org.
+    telegram_bot_api_server: str | None = None
     # Spelled out here, and nothing else derives anything from it. It used to live in
     # src/heartbeat.py so the health probe could place the mark beside the database without
     # importing Settings; the mark no longer goes anywhere near the database, so the reason is
@@ -35,7 +23,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    @field_validator("telegram_api_server")
+    @field_validator("telegram_bot_api_server")
     @classmethod
     def _normalise_api_server(cls, value: str | None) -> str | None:
         """Treat a blank value as "not set", and reject an address with no http(s) scheme.
@@ -62,12 +50,9 @@ class Settings(BaseSettings):
         `docker logs` for the life of the container. Failing at startup instead costs a
         restart loop that names the real problem.
 
-        The message below deliberately names the variables and the fix and NOTHING else — in
+        The message below deliberately names the variable and the fix and NOTHING else — in
         particular not the token, which is a field of this same model. pydantic appends the
         rejected value to it, and that value is the server address, which is not a secret.
-        BOTH accepted spellings are named because pydantic heads the error with the first
-        alias whichever one was actually set, and a message naming only that one would send
-        somebody who wrote TELEGRAM_API_SERVER looking for a variable they never set.
 
         AND THAT IS WHY THERE IS NO VALIDATOR ON telegram_bot_token, tempting as one looks
         sitting next to this. pydantic renders a rejected value into the error text as
@@ -96,7 +81,7 @@ class Settings(BaseSettings):
         scheme = urlsplit(value).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(
-                "the Bot API server address (TELEGRAM_BOT_API_SERVER, or TELEGRAM_API_SERVER) "
+                "the Bot API server address (TELEGRAM_BOT_API_SERVER) "
                 "must start with http:// or https:// — a bare host:port cannot be turned into "
                 "a request URL, and the library error that would follow quotes the full URL, "
                 "which carries the bot token"
