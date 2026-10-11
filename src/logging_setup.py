@@ -1,42 +1,23 @@
 """Logging for the whole process: one sink, one format, and the token scrubbed on the way out.
 
-Three separate things are set up here and they all answer the same failure. A Telegram request
-URL carries the bot token in its PATH — `<server>/bot<token>/getUpdates` — so any library that
-puts a request URL into an error message puts the token into it as well. That is not
-hypothetical: give TELEGRAM_BOT_API_SERVER a value with the scheme left off (`10.0.0.1:8081`
-instead of `http://10.0.0.1:8081`, the obvious typo) and aiohttp raises NonHttpUrlClientError
-whose text is the full URL, token included; aiogram wraps it in TelegramNetworkError and it
-goes out as a log line or a traceback. `docker logs` then keeps it for as long as the
-container lives, and the updater's containers live a long time.
+A Telegram request URL carries the bot token in its path (`<server>/bot<token>/getUpdates`), so
+any library that puts a request URL into an error message leaks the token; e.g. a schemeless
+TELEGRAM_BOT_API_SERVER makes aiohttp raise NonHttpUrlClientError with the full URL. Three
+measures:
 
-* THE SINK REDACTS. Every line loguru writes — message, extra, and the traceback of an
-  exception logged with `logger.exception` — is rendered first and passed through redact()
-  before it reaches stderr. src/settings.py refuses a schemeless server URL outright, so the
-  path above is closed at its source; this covers the paths nobody has thought of yet.
-* STDLIB LOGGING IS REROUTED into loguru. aiogram, apscheduler and aiohttp all log through the
-  stdlib `logging` module, and main.py used to configure loguru alone — so those records had no
-  handler anywhere on their chain. Two things then happened to them, and they are worth keeping
-  apart because the usual one-line summary ("lastResort drops them") names the wrong mechanism.
-  A record below WARNING never got as far as a handler at all: `Logger.isEnabledFor` compares
-  against the EFFECTIVE level, which with nothing configured is the root logger's default of
-  WARNING, so the record was not even created — verified on this project's interpreter. A record
-  at WARNING or above WAS emitted, through `logging.lastResort`: stderr, bare message, no
-  attribution, and past both LOG_LEVEL and the redaction above. Routing them here is
-  also the only reason a polling failure is visible at all: aiogram's
-  `Dispatcher._listen_updates` catches every exception around getUpdates and retries forever
-  behind a backoff, so a bot whose polling has permanently failed — a 409 because something
-  else started polling the same token, a revoked token, a Bot API server that went away after
-  startup — keeps its process, its scheduler and its heartbeat, and the healthcheck stays
-  green. The log is where that failure appears, or nowhere. (A failure already present at
-  STARTUP does not get that far: `set_my_commands` raises before polling begins and the process
-  dies, which the healthcheck does catch.)
-* sys.excepthook REDACTS TOO. The traceback of an exception that kills the process is printed
-  by the interpreter itself and never passes through a handler of any kind.
+* THE SINK REDACTS. Every line loguru writes (message, extra, traceback) is rendered and passed
+  through redact() before reaching stderr. src/settings.py also rejects a schemeless server URL.
+* STDLIB LOGGING IS REROUTED into loguru. aiogram, apscheduler and aiohttp log through stdlib
+  `logging`; without a handler, records below WARNING are never created (root's default level)
+  and those at WARNING+ go through `logging.lastResort`, bare, unattributed and unredacted. This
+  is also the only place a permanent polling failure shows: aiogram's
+  `Dispatcher._listen_updates` retries getUpdates forever, so a 409, a revoked token or a lost
+  Bot API server after startup keeps the process and the healthcheck green. (Failures at startup
+  kill the process, which the healthcheck catches.)
+* sys.excepthook REDACTS TOO: the traceback of a fatal exception bypasses all handlers.
 
-What this module deliberately does NOT do is guarantee the token cannot leak. A subprocess
-that writes to the inherited stderr, or C-level output, goes around all three. The guarantee
-is narrower and worth stating exactly: everything THIS process logs, and the traceback it dies
-of, are scrubbed.
+Not a guarantee: a subprocess writing to the inherited stderr, or C-level output, goes around
+all three. What is scrubbed is everything this process logs and the traceback it dies of.
 """
 
 import logging
@@ -46,27 +27,16 @@ import traceback
 from loguru import logger
 
 TOKEN_PLACEHOLDER = "***REDACTED***"
-# The shortest string this will blind-replace throughout a log line. It applies to BOTH the
-# whole token and its secret half, and the bound on the whole token is the one that matters:
-# TELEGRAM_BOT_TOKEN is a plain `str` with no format check, so `TELEGRAM_BOT_TOKEN=test` is a
-# thing a stack can really be given — and replacing every occurrence of `test` in everything
-# this process logs would corrupt arbitrary text, starting with the traceback that says the
-# token is invalid. Below the bound the choice is deliberate: a string that short cannot
-# authenticate anything (a real token is `<numeric id>:<35-character secret>`), so keeping the
-# log readable is worth more than scrubbing it. A real token, and a real token's secret half,
-# are both far above this.
+# The shortest string redact() will blind-replace, applied to the whole token and to its secret
+# half. TELEGRAM_BOT_TOKEN has no format check, so a value like `test` is possible, and replacing
+# every `test` would corrupt the log. A string this short cannot authenticate anything (a real
+# token is `<numeric id>:<35-character secret>`).
 MIN_SECRET_LENGTH = 8
 
-# The level names loguru knows, and the ONLY values `logger.add(level=...)` and `logger.level()`
-# accept. Checked against loguru 0.7.2, which is what requirements.txt pins: both raise
-# `ValueError: Level 'info' does not exist` for anything outside this tuple — INCLUDING a correct
-# name in the wrong case, which is the trap this exists for.
-#
-# It lives here, next to the code that consumes it, and src/settings.py imports it to validate
-# LOG_LEVEL. That is the position that matters: configure_logging() runs BEFORE the sink and the
-# excepthook exist, so a ValueError raised inside it is an unformatted crash on every restart,
-# forever — the same class of failure as the empty TELEGRAM_BOT_API_SERVER. Rejecting the value
-# in Settings instead at least names the field and the accepted spellings.
+# The level names loguru 0.7.2 accepts in `logger.add(level=...)` and `logger.level()`; anything
+# else, including a correct name in the wrong case, raises ValueError. src/settings.py imports
+# this to validate LOG_LEVEL, because configure_logging() runs before the sink and excepthook
+# exist and a ValueError there would be an unformatted crash on every restart.
 LOG_LEVELS = ("TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL")
 
 
@@ -104,9 +74,8 @@ class InterceptHandler(logging.Handler):
             # A custom numeric level loguru has no name for. Pass the number through rather
             # than dropping the record.
             level = record.levelno
-        # `sys._getframe()` is THIS frame, not logging's idea of the caller — `logging.currentframe`
-        # is `sys._getframe(3)` and starting there lands past the frames that have to be counted,
-        # which shows every intercepted line as coming from logging/__init__.py.
+        # Start from THIS frame: `logging.currentframe` is `sys._getframe(3)` and would skip
+        # frames that must be counted, attributing every line to logging/__init__.py.
         frame, depth = sys._getframe(), 0
         while frame is not None and (depth == 0 or frame.f_code.co_filename == logging.__file__):
             frame = frame.f_back
@@ -135,17 +104,12 @@ def configure_logging(token, level="INFO"):
 
     logger.add(sink, level=level)
 
-    # `force=True` replaces whatever handlers are already on the root logger, so this is not
-    # additive with a library that configured logging at import time.
+    # `force=True` replaces any handlers already on the root logger.
     #
-    # THE LEVEL IS THE REAL ONE, not NOTSET. At NOTSET every DEBUG record any library emits is
-    # built, %-formatted, handed to InterceptHandler and walked frame by frame — all to be
-    # dropped by the sink at the end of it. Setting the root threshold means those records are
-    # never created. loguru's level numbers ARE the stdlib's (DEBUG 10, INFO 20, …), so its own
-    # table is what translates LOG_LEVEL here; it cannot fail, because logger.add() above has
-    # already rejected any name loguru does not know.
-    # A library that sets its OWN logger level lower still gets through — a logger with an
-    # explicit level ignores the root's — and loguru's sink filters it, exactly as before.
+    # The root level is the real one, not NOTSET, so records below it are never built and
+    # walked through InterceptHandler only to be dropped. loguru's level numbers are the
+    # stdlib's, and logger.add() above has already rejected unknown names. A library logger
+    # with its own lower level still gets through and is filtered by the sink.
     logging.basicConfig(
         handlers=[InterceptHandler()],
         level=logger.level(level).no if isinstance(level, str) else level,

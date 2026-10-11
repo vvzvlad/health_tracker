@@ -9,14 +9,9 @@ from src.logging_setup import LOG_LEVELS
 class Settings(BaseSettings):
     telegram_bot_token: str
     # Read from TELEGRAM_BOT_API_SERVER, the env name every bot in the park uses for the local
-    # Bot API server. This field once read a different name, and with `extra="ignore"` below
-    # the variable the stack really passed was dropped without a word, leaving the bot on
-    # api.telegram.org.
+    # Bot API server. Note `extra="ignore"` below: a misspelled variable is dropped silently.
     telegram_bot_api_server: str | None = None
-    # Spelled out here, and nothing else derives anything from it. It used to live in
-    # src/heartbeat.py so the health probe could place the mark beside the database without
-    # importing Settings; the mark no longer goes anywhere near the database, so the reason is
-    # gone and the constant is back where it is used.
+    # Nothing else derives anything from it (the heartbeat mark does not live near the database).
     database_path: str = "data/health.db"
     default_timezone: str = "+03:00"
     log_level: str = "INFO"
@@ -28,50 +23,21 @@ class Settings(BaseSettings):
     def _normalise_api_server(cls, value: str | None) -> str | None:
         """Treat a blank value as "not set", and reject an address with no http(s) scheme.
 
-        THE BLANK CASE IS NOT COSMETIC. `TELEGRAM_BOT_API_SERVER=` in a compose file, a
-        `${VAR:-}` that expanded to nothing, an environment field left empty in Portainer — all
-        of them set the variable to an empty STRING, and pydantic-settings does not treat that
-        as absent (`env_ignore_empty` is False by default). It reaches this validator as `""`,
-        whose `urlsplit("").scheme` is `""`, so without this branch it would fail the scheme
-        check below and raise a ValidationError at `import src.settings` — before
-        configure_logging() has run, i.e. as an unformatted crash, on every restart, forever.
-        A variable that is declared and left empty means "no local server"; the cloud branch is
-        the answer, not a restart loop.
+        A blank value (`TELEGRAM_BOT_API_SERVER=`, `${VAR:-}`, an empty Portainer field) reaches
+        here as `""` (`env_ignore_empty` is False), and failing the scheme check on it would crash
+        at `import src.settings`, before logging is configured, on every restart. Blank means "no
+        local server". The value is returned stripped, since stray whitespace is invisible in logs.
 
-        The value is also returned STRIPPED. A trailing space or newline picked up from a
-        compose file is invisible in the log line that echoes the address back and produces a
-        request URL nobody can spot the fault in.
+        The scheme check is a secrecy guard: for `10.0.0.1:8081` aiohttp raises
+        NonHttpUrlClientError quoting the whole request URL, whose path carries the token, and it
+        would end up in `docker logs`. The message names only the variable and the fix; pydantic
+        appends the rejected value, which is the server address and not a secret.
 
-        THE REST IS A SECRECY GUARD, not a tidiness one. Leaving the scheme off — `10.0.0.1:8081`
-        instead of `http://10.0.0.1:8081` — is the natural way to write this variable wrong,
-        and aiohttp answers it with NonHttpUrlClientError whose text is the WHOLE request URL.
-        A Telegram request URL carries the token in its path, so that exception text is the
-        token; aiogram wraps it in TelegramNetworkError, something logs it, and it stays in
-        `docker logs` for the life of the container. Failing at startup instead costs a
-        restart loop that names the real problem.
-
-        The message below deliberately names the variable and the fix and NOTHING else — in
-        particular not the token, which is a field of this same model. pydantic appends the
-        rejected value to it, and that value is the server address, which is not a secret.
-
-        AND THAT IS WHY THERE IS NO VALIDATOR ON telegram_bot_token, tempting as one looks
-        sitting next to this. pydantic renders a rejected value into the error text as
-        `input_value=...`, so a token-format check would print the token itself — unformatted,
-        before configure_logging() exists to scrub it, into a restart loop that repeats it for
-        as long as the container is redeployed. It would buy little: aiogram's own
-        `validate_token` rejects a malformed token at `Bot(...)` with "Token is invalid!", after
-        logging is configured and without quoting the value.
-
-        THAT COVERS THE EMPTY TOKEN TOO, which is the case that looks most like the blank server
-        address above — `TELEGRAM_BOT_TOKEN=` declared in a compose file and left empty, accepted
-        here because it is a perfectly good `str`. An emptiness check would not leak anything (an
-        empty string is safe for pydantic to echo), so the argument above does not apply to it —
-        and it is still not worth having: it would move a failure that currently arrives READABLE,
-        through the configured sink, into the one place that cannot report it, and it would cover
-        a strict subset of what `validate_token` already refuses. What the empty token really
-        needed was for that refusal to KILL the container instead of hanging it, which is a
-        property of main.py's `try`/`finally` rather than of this model; ci/smoke.py has a row that
-        runs the real main.py on an empty token and requires it to die.
+        There is deliberately no validator on telegram_bot_token: pydantic would render a
+        rejected token into the error as `input_value=...`, unformatted and before the redacting
+        sink exists. aiogram's `validate_token` already rejects a malformed or empty token at
+        `Bot(...)`, readably and after logging is set up; main.py's `try`/`finally` makes that
+        kill the container (ci/smoke.py has a row checking that an empty token dies).
         """
         if value is None:
             return None
@@ -93,25 +59,15 @@ class Settings(BaseSettings):
     def _normalise_log_level(cls, value: str) -> str:
         """Upper-case the level, treat a blank value as "not set", and reject an unknown name.
 
-        THE CASE IS THE WHOLE POINT, and it is the same class of failure as the empty server
-        address above. loguru's level names are upper case and its lookup is exact: on the pinned
-        loguru 0.7.2 both `logger.add(sink, level="info")` and `logger.level("info")` raise
-        `ValueError: Level 'info' does not exist`. This field was a plain `str` with no
-        normalisation, so `LOG_LEVEL=info` in a stack — which is how most people write it —
-        raised inside configure_logging(), i.e. BEFORE the sink and the excepthook it installs
-        existed: an unformatted crash, on every restart, forever.
+        loguru's level names are upper case and its lookup is exact (loguru 0.7.2 raises
+        `ValueError: Level 'info' does not exist`), and configure_logging() runs before the sink
+        and excepthook exist, so `LOG_LEVEL=info` would be an unformatted crash on every restart.
 
-        A blank value falls back to the default for the same reason the server address does:
-        `LOG_LEVEL=` in a compose file, or an empty field in Portainer, sets an empty STRING, and
-        pydantic-settings does not treat that as absent.
+        A blank value (`LOG_LEVEL=` in compose, an empty Portainer field) is an empty string to
+        pydantic-settings, so it falls back to the default here.
 
-        An unknown name is REJECTED HERE rather than left to blow up later. Both are a startup
-        failure, but this one names the field and the accepted spellings, and it arrives as a
-        pydantic error rather than as a bare ValueError from inside the logging setup.
-
-        Unlike the token, the value is safe to quote: a log level is not a secret, so pydantic
-        appending `input_value=...` to the message is help rather than a leak. That asymmetry is
-        exactly why telegram_bot_token still has no validator — see the note above.
+        An unknown name is rejected here, where the error names the field and the accepted
+        spellings. A log level is not a secret, so pydantic quoting `input_value=...` is fine.
         """
         value = value.strip().upper()
         if not value:
